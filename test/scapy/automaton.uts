@@ -467,6 +467,133 @@ graph = HelloWorld.build_graph()
 assert graph.startswith("digraph")
 assert '"BEGIN" -> "END"' in graph
 
+= Automaton offline replay - retransmit, late answer, give up
+~ automaton
+
+class RetryATMT(Automaton):
+    def parse_args(self, max_retries=2, rto=60.0, **kargs):
+        Automaton.parse_args(self, **kargs)
+        self.max_retries = max_retries
+        self.retries = 0
+        self.timer_by_name("wait_timeout").set(rto)
+    @ATMT.state(initial=1)
+    def BEGIN(self):
+        raise self.WAIT()
+    @ATMT.state()
+    def WAIT(self):
+        self.send(Raw(load=b"ping"))
+    @ATMT.receive_condition(WAIT)
+    def got_pong(self, pkt):
+        if pkt.load == b"pong":
+            raise self.END()
+    @ATMT.timeout(WAIT, 60.0)
+    def wait_timeout(self):
+        if self.retries >= self.max_retries:
+            raise self.GIVEUP()
+        self.retries += 1
+        raise self.WAIT()
+    @ATMT.state(final=1)
+    def GIVEUP(self):
+        return "giveup"
+    @ATMT.state(final=1)
+    def END(self):
+        return "done"
+
+# The answer arrives late: two retransmissions happen first
+r1 = OfflineReplay(RetryATMT, [(150.0, Raw(load=b"pong"))])
+assert r1.run() == "done"
+assert [s for _, s in r1.states] == ["BEGIN", "WAIT", "WAIT", "WAIT", "END"]
+assert [t for t, _ in r1.sent] == [0.0, 60.0, 120.0]
+assert [t for t, _ in r1.received] == [150.0]
+assert [bytes(p) for _, p in r1.sent] == [b"ping"] * 3
+
+# No answer at all: the automaton gives up
+r2 = OfflineReplay(RetryATMT, [])
+assert r2.run() == "giveup"
+assert [t for t, _ in r2.sent] == [0.0, 60.0, 120.0]
+assert r2.states[-1] == (180.0, "GIVEUP")
+
+# Replaying the same events produces the same trace
+r3 = OfflineReplay(RetryATMT, [(150.0, Raw(load=b"pong"))])
+r3.run()
+assert r3.states == r1.states
+assert [t for t, _ in r3.sent] == [t for t, _ in r1.sent]
+assert [bytes(p) for _, p in r3.sent] == [bytes(p) for _, p in r1.sent]
+
+= Automaton offline replay - virtual time
+~ automaton
+import time
+
+# Waiting one day does not take one day
+r4 = OfflineReplay(RetryATMT, [(90000.0, Raw(load=b"pong"))], rto=86400.0)
+t0 = time.time()
+assert r4.run() == "done"
+assert time.time() - t0 < 5
+assert [t for t, _ in r4.sent] == [0.0, 86400.0]
+assert [t for t, _ in r4.received] == [90000.0]
+
+# A timer and a packet at the same virtual time: the timer expires first
+class TieATMT(Automaton):
+    @ATMT.state(initial=1)
+    def S(self):
+        pass
+    @ATMT.timeout(S, 10.0)
+    def to(self):
+        raise self.TIMER()
+    @ATMT.receive_condition(S)
+    def rcv(self, pkt):
+        raise self.PACKET()
+    @ATMT.state(final=1)
+    def TIMER(self):
+        return "timer"
+    @ATMT.state(final=1)
+    def PACKET(self):
+        return "packet"
+
+assert OfflineReplay(TieATMT, [(10.0, Raw(load=b"x"))]).run() == "timer"
+assert OfflineReplay(TieATMT, [(9.999, Raw(load=b"x"))]).run() == "packet"
+
+= Automaton offline replay - loop and stuck detection
+~ automaton
+
+# Infinite loop of immediate transitions (no time progress)
+class LoopATMT(Automaton):
+    @ATMT.state(initial=1)
+    def A(self):
+        raise self.B()
+    @ATMT.state()
+    def B(self):
+        pass
+    @ATMT.condition(B)
+    def again(self):
+        raise self.A()
+
+try:
+    OfflineReplay(LoopATMT, [], max_chained_transitions=100).run()
+except OfflineReplayError as exc:
+    "looping without time progress" in str(exc)
+else:
+    False
+
+# No scripted packet and no timer left to wake the automaton
+class WaitATMT(Automaton):
+    @ATMT.state(initial=1)
+    def S(self):
+        pass
+    @ATMT.receive_condition(S)
+    def rcv(self, pkt):
+        raise self.E()
+    @ATMT.state(final=1)
+    def E(self):
+        return 1
+
+try:
+    OfflineReplay(WaitATMT, []).run()
+except OfflineReplayError as exc:
+    "stuck in state [S]" in str(exc)
+else:
+    False
+
 = TCP_client automaton
 ~ automaton netaccess needs_root
 * This test retries on failure because it may fail quite easily

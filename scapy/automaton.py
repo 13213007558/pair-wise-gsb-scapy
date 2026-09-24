@@ -43,6 +43,7 @@ from typing import (
     Deque,
     Dict,
     Generic,
+    Generator,
     Iterable,
     Iterator,
     List,
@@ -916,6 +917,7 @@ class Automaton(metaclass=Automaton_metaclass):
         self.send_sock = None  # type: Optional[SuperSocket]
         self.is_atmt_socket = kargs.pop("is_atmt_socket", False)
         self.atmt_socket = kargs.pop("atmt_socket", None)
+        self.replay = kargs.pop("replay", None)  # type: Optional[OfflineReplay]  # noqa: E501
         self.started = threading.Lock()
         self.threadid = None                # type: Optional[int]
         self.breakpointed = None
@@ -958,7 +960,8 @@ class Automaton(metaclass=Automaton_metaclass):
             setattr(self, stname,
                     _instance_state(getattr(self, stname)))
 
-        self.start()
+        if self.replay is None:
+            self.start()
 
     def parse_args(self, debug=0, store=0, session=None, **kargs):
         # type: (int, int, Any, Any) -> None
@@ -1302,19 +1305,7 @@ class Automaton(metaclass=Automaton_metaclass):
             if self.threadid is None:
                 self.threadid = 0
 
-            # Update default parameters
-            a = args + self.init_args[len(args):]
-            k = self.init_kargs.copy()
-            k.update(kargs)
-            self.parse_args(*a, **k)
-
-            # Start the automaton
-            self.state = self.initial_states[0](self)
-            self.send_sock = self.sock or self.send_sock_class(**self.socket_kargs)
-            if self.recv_conditions:
-                # Only start a receiving socket if we have at least one recv_conditions
-                self.listen_sock = self.sock or self.recv_sock_class(**self.socket_kargs)  # noqa: E501
-            self.packets = PacketList(name="session[%s]" % self.__class__.__name__)
+            self._control_setup(args, kargs)
 
             singlestep = True
             iterator = self._do_iter()
@@ -1366,13 +1357,61 @@ class Automaton(metaclass=Automaton_metaclass):
                 self.cmdout.send(m)
             self.debug(3, "Stopping control thread (tid=%i)" % self.threadid)
             self.threadid = None
-            if self.listen_sock:
-                self.listen_sock.close()
-            if self.send_sock:
-                self.send_sock.close()
+            self._control_teardown()
+
+    def _control_setup(self, args, kargs):
+        # type: (Tuple[Any, ...], Dict[str, Any]) -> None
+        """
+        Parse the init arguments and setup the state, sockets and packet
+        storage of the automaton. This is shared by the control thread
+        (_do_control) and the offline replay driver (OfflineReplay).
+        """
+        # Update default parameters
+        a = args + self.init_args[len(args):]
+        k = self.init_kargs.copy()
+        k.update(kargs)
+        self.parse_args(*a, **k)
+
+        # Start the automaton
+        self.state = self.initial_states[0](self)
+        self.send_sock = self.sock or self.send_sock_class(**self.socket_kargs)
+        if self.recv_conditions:
+            # Only start a receiving socket if we have at least one recv_conditions
+            self.listen_sock = self.sock or self.recv_sock_class(**self.socket_kargs)  # noqa: E501
+        self.packets = PacketList(name="session[%s]" % self.__class__.__name__)
+
+    def _control_teardown(self):
+        # type: () -> None
+        """Close the sockets opened by _control_setup."""
+        if self.listen_sock:
+            self.listen_sock.close()
+        if self.send_sock:
+            self.send_sock.close()
+
+    def _get_time(self):
+        # type: () -> float
+        """
+        Current time, as seen by the automaton. This is the only time
+        source used by _do_iter: during an offline replay, it returns
+        the virtual clock of the OfflineReplay driver.
+        """
+        if self.replay is not None:
+            return self.replay.now
+        return time.time()
+
+    def _select(self, fds, remain, select_func):
+        # type: (List[Any], Optional[float], Callable[[List[Any], Optional[float]], List[Any]]) -> List[Any]  # noqa: E501
+        """
+        Wait until one of the fds is readable or remain seconds have
+        elapsed. During an offline replay, the wait is emulated by the
+        OfflineReplay driver which advances its virtual clock instead.
+        """
+        if self.replay is not None:
+            return self.replay._wait(fds, remain)
+        return select_func(fds, remain)
 
     def _do_iter(self):
-        # type: () -> Iterator[Union[Automaton.AutomatonException, Automaton.AutomatonStopped, ATMT.NewStateRequested, None]] # noqa: E501
+        # type: () -> Generator[Union[Automaton.AutomatonException, Automaton.AutomatonStopped, ATMT.NewStateRequested, None], None, None] # noqa: E501
         while True:
             try:
                 self.debug(1, "## state=[%s]" % self.state.state)
@@ -1414,7 +1453,7 @@ class Automaton(metaclass=Automaton_metaclass):
 
                 # Finally listen and pay attention to timeouts
                 timers.reset()
-                time_previous = time.time()
+                time_previous = self._get_time()
 
                 fds = [self.cmdin]  # type: List[Union[SuperSocket, ObjectPipe[Any]]]
                 select_func = select_objects
@@ -1424,7 +1463,7 @@ class Automaton(metaclass=Automaton_metaclass):
                 for ioev in self.ioevents[self.state.state]:
                     fds.append(self.ioin[ioev.atmt_ioname])
                 while True:
-                    time_current = time.time()
+                    time_current = self._get_time()
                     timers.decrement(time_current - time_previous)
                     time_previous = time_current
                     for timer in timers.expired():
@@ -1432,7 +1471,7 @@ class Automaton(metaclass=Automaton_metaclass):
                     remain = timers.until_next()
 
                     self.debug(5, "Select on %r" % fds)
-                    r = select_func(fds, remain)
+                    r = self._select(fds, remain, select_func)
                     self.debug(5, "Selected %r" % r)
                     for fd in r:
                         self.debug(5, "Looking at %r" % fd)
@@ -1632,3 +1671,199 @@ class Automaton(metaclass=Automaton_metaclass):
         # type: (...) -> Any
         rsm = Message(type=_ATMT_Command.REJECT)
         return self.run(resume=rsm, wait=wait)
+
+
+class OfflineReplayError(Automaton.AutomatonError):
+    """An error occurred during an offline replay."""
+    pass
+
+
+class _OfflineSocket:
+    """
+    Fake bidirectional socket used by OfflineReplay. It feeds the
+    automaton with the scripted packets and captures everything it
+    sends: nothing is sent to a real network.
+    """
+
+    def __init__(self, replay):
+        # type: (OfflineReplay) -> None
+        self.replay = replay
+        self.closed = False
+
+    def send(self, pkt, **kwargs):
+        # type: (Packet, Any) -> int
+        self.replay._on_send(pkt)
+        return 1
+
+    def recv(self, n=MTU, **kwargs):
+        # type: (int, Any) -> Packet
+        return self.replay._pop_event()
+
+    def fileno(self):
+        # type: () -> int
+        # Never actually select()ed: OfflineReplay._wait emulates it.
+        return -1
+
+    @staticmethod
+    def select(sockets, remain=conf.recv_poll_rate):
+        # type: (List[Any], Optional[float]) -> List[Any]
+        # Unused: OfflineReplay._wait replaces select() during a replay.
+        return []
+
+    def close(self):
+        # type: () -> None
+        self.closed = True
+
+
+class OfflineReplay:
+    """
+    Offline driver for an Automaton: replays the automaton against a
+    scripted list of packets using a virtual clock, without creating any
+    socket nor sleeping. The automaton runs through the exact same code
+    path (_do_iter) as a normal, online run.
+
+    Usage::
+
+        replay = OfflineReplay(MyAutomaton, [(60.0, pkt1), (120.0, pkt2)])
+        replay.run()
+        replay.states    # [(t, state_name), ...] entered states
+        replay.sent      # [(t, packet), ...] packets the automaton sent
+        replay.received  # [(t, packet), ...] packets it consumed
+        replay.result    # output of the final state
+
+    :param automaton: the Automaton subclass to replay
+    :param events: an iterable of (virtual_time, packet) tuples. Packets
+        are delivered to the automaton when the virtual clock reaches
+        their associated time.
+    :param start: initial value of the virtual clock (default: 0.0)
+    :param max_chained_transitions: maximum number of consecutive state
+        transitions allowed without the automaton waiting (i.e. without
+        any time progress). If exceeded, OfflineReplayError is raised:
+        this detects infinite loops of immediate transitions.
+    :param kwargs: additional arguments are passed to the automaton
+
+    Notes:
+
+    - the virtual clock only advances when the automaton waits. Waiting
+      one minute or one day takes the same (null) amount of real time.
+    - when a timeout and a scripted packet are scheduled at the exact
+      same virtual time, the timeout expires first.
+    - everything the automaton sends is captured in .sent; nothing
+      reaches a real socket.
+    - a replay is deterministic: replaying the same events twice
+      produces the same trace.
+    - external fds (ioevents) are not triggered during a replay.
+    """
+
+    def __init__(self,
+                 automaton,                     # type: Type[Automaton]
+                 events,                        # type: Iterable[Tuple[float, Packet]]  # noqa: E501
+                 start=0.0,                     # type: float
+                 max_chained_transitions=1000,  # type: int
+                 **kwargs                       # type: Any
+                 ):
+        # type: (...) -> None
+        self.now = start
+        self.max_chained_transitions = max_chained_transitions
+        # Scripted packets, sorted by virtual time. sorted() is stable so
+        # that events sharing the same time keep their input order.
+        self.events = deque(
+            sorted(events, key=lambda x: x[0])
+        )  # type: Deque[Tuple[float, Packet]]
+        # Replay trace
+        self.states = []        # type: List[Tuple[float, str]]
+        self.sent = []          # type: List[Tuple[float, Packet]]
+        self.received = []      # type: List[Tuple[float, Packet]]
+        self.result = None      # type: Any
+        # Watchdog against infinite loops of immediate transitions
+        self._chained = 0
+        self._recent_states = deque(maxlen=20)  # type: Deque[str]
+        self._sock = _OfflineSocket(self)
+        self.atmt = automaton(sock=self._sock, replay=self, **kwargs)
+
+    def run(self):
+        # type: () -> Any
+        """
+        Run the replay until the automaton reaches a final state.
+        Returns the output of the final state.
+        """
+        atmt = self.atmt
+        atmt._control_setup((), {})
+        self.states.append((self.now, atmt.state.state))
+        iterator = atmt._do_iter()
+        try:
+            while True:
+                try:
+                    state_req = next(iterator)
+                except StopIteration:
+                    self.result = atmt.final_state_output
+                    break
+                if isinstance(state_req, ATMT.NewStateRequested):
+                    self._on_transition(state_req.state)
+        finally:
+            iterator.close()
+            atmt._control_teardown()
+        return self.result
+
+    def _on_transition(self, state):
+        # type: (str) -> None
+        """Record a state transition and watch for infinite loops."""
+        self.states.append((self.now, state))
+        self._recent_states.append(state)
+        self._chained += 1
+        if self._chained > self.max_chained_transitions:
+            raise OfflineReplayError(
+                "automaton %s is looping without time progress at "
+                "t=%.6f (last states: %s)" % (
+                    self.atmt.__class__.__name__,
+                    self.now,
+                    " -> ".join(self._recent_states),
+                )
+            )
+
+    def _wait(self, fds, remain):
+        # type: (List[Any], Optional[float]) -> List[Any]
+        """
+        Emulated select(): advance the virtual clock to the next event
+        (scripted packet or timer expiration) and return the ready fds.
+        """
+        # Waiting is an opportunity for the automaton to make progress:
+        # reset the watchdog of chained immediate transitions.
+        self._chained = 0
+        # Time at which the next timer expires
+        timer_at = self.now + remain if remain is not None else None
+        # Time of the next scripted packet, if it can be delivered: the
+        # socket is only selectable in states with a recv_condition.
+        packet_at = None
+        if self.events and self._sock in fds:
+            packet_at = self.events[0][0]
+        if packet_at is not None and (timer_at is None or
+                                      packet_at < timer_at):
+            # A packet arrives before any timer expires: deliver it.
+            self.now = max(self.now, packet_at)
+            return [self._sock]
+        if timer_at is not None:
+            # A timer expires first (timers win over packets scheduled
+            # at the exact same virtual time).
+            self.now = timer_at
+            return []
+        raise OfflineReplayError(
+            "automaton %s is stuck in state [%s] at t=%.6f: no scripted "
+            "packet or timer can wake it" % (
+                self.atmt.__class__.__name__,
+                self.atmt.state.state,
+                self.now,
+            )
+        )
+
+    def _on_send(self, pkt):
+        # type: (Packet) -> None
+        """Capture a packet sent by the automaton."""
+        self.sent.append((self.now, pkt))
+
+    def _pop_event(self):
+        # type: () -> Packet
+        """Pop the next scripted packet (called by _OfflineSocket.recv)."""
+        _, pkt = self.events.popleft()
+        self.received.append((self.now, pkt))
+        return pkt

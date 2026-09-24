@@ -373,4 +373,50 @@ Some protocols allow timer configuration. In order to configure timeout values d
 
 	@ATMT.timeout(WAITING, 10.0)
 	def waiting_timeout(self):
+
+Offline replay
+--------------
+
+An automaton can be tested without any socket or real sleep using
+``OfflineReplay``. The driver runs the automaton through its usual code
+path, but takes over the clock and the I/O: it feeds the automaton with a
+scripted list of packets, each associated with a virtual time, advances a
+virtual clock when the automaton waits, and captures everything the
+automaton sends. Nothing reaches a real network, and waiting one minute or
+one day takes the same (null) amount of real time::
+
+    class MyClient(Automaton):
+        @ATMT.state(initial=1)
+        def WAITING(self):
+            self.send(IP(dst="1.2.3.4")/ICMP())
+
+        @ATMT.receive_condition(WAITING)
+        def got_answer(self, pkt):
+            raise self.END()
+
+        @ATMT.timeout(WAITING, 60)
+        def waiting_timeout(self):
+            raise self.WAITING()  # retransmit
+
+        @ATMT.state(final=1)
+        def END(self):
+            pass
+
+    replay = OfflineReplay(MyClient, [(150.0, IP()/ICMP())])
+    replay.run()
+    replay.states    # [(0.0, 'WAITING'), (60.0, 'WAITING'), (120.0, 'WAITING'), (150.0, 'END')]
+    replay.sent      # [(0.0, <IP ...>), (60.0, <IP ...>), (120.0, <IP ...>)]
+    replay.received  # [(150.0, <IP ...>)]
+
+The replay is deterministic: replaying the same events twice produces the
+same trace. When a timeout and a scripted packet are scheduled at the exact
+same virtual time, the timeout expires first.
+
+If the automaton keeps changing state without any time progress (an
+infinite loop of immediate transitions), ``OfflineReplayError`` is raised
+with the current virtual time and the latest states. The same exception is
+raised when the automaton is stuck waiting with no scripted packet and no
+timer left to wake it. The maximum number of consecutive transitions
+allowed without time progress can be tuned with the
+``max_chained_transitions`` parameter (default: 1000).
 	    raise self.END()
