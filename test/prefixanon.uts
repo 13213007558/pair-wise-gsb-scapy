@@ -1,0 +1,195 @@
+% Offline prefix-preserving pcap anonymization
+
+~ prefixanon
+
+############
++ PrefixPreservingMapping
+
+= Shared prefixes are preserved (IPv4)
+~ prefixanon
+
+from scapy.modules.prefixanon import (
+    PrefixPreservingMapping,
+    anonymize_pcap,
+)
+from scapy.layers.inet import IP, IPerror, TCP, UDP, ICMP
+from scapy.layers.inet6 import IPv6, IPerror6, ICMPv6DestUnreach
+from scapy.layers.l2 import Ether, ARP
+from scapy.utils import RawPcapWriter
+
+import ipaddress
+
+KEY = b"prefixanon test key"
+
+def common_prefix_length(a, b, bits):
+    x = int(ipaddress.ip_address(a)) ^ int(ipaddress.ip_address(b))
+    n = 0
+    for i in range(bits - 1, -1, -1):
+        if (x >> i) & 1:
+            break
+        n += 1
+    return n
+
+mapping = PrefixPreservingMapping(KEY)
+groups = [
+    ("192.0.2.1", "192.0.2.200"),    # 24 common bits
+    ("10.1.0.1", "10.2.0.1"),        # 14 common bits
+    ("172.16.5.9", "172.16.5.11"),   # 30 common bits
+]
+ok = True
+for a, b in groups:
+    ma, mb = mapping.anonymize_ipv4(a), mapping.anonymize_ipv4(b)
+    ok = ok and ma != a and mb != b
+    ok = ok and common_prefix_length(a, b, 32) == \
+        common_prefix_length(ma, mb, 32)
+
+ok
+
+= Shared prefixes are preserved (IPv6)
+~ prefixanon
+
+groups = [
+    ("2001:db8:1::1", "2001:db8:2::1"),
+    ("2001:db8:aaaa::1", "2001:db8:bbbb::1"),
+    ("fd00::1", "fd00::2"),
+]
+ok = True
+for a, b in groups:
+    ma, mb = mapping.anonymize_ipv6(a), mapping.anonymize_ipv6(b)
+    ok = ok and ma != a and mb != b
+    ok = ok and common_prefix_length(a, b, 128) == \
+        common_prefix_length(ma, mb, 128)
+
+ok
+
+= Mapping is deterministic and depends on the key
+~ prefixanon
+
+same = PrefixPreservingMapping(KEY)
+other = PrefixPreservingMapping(b"another key")
+(same.anonymize_ipv4("192.0.2.1") == mapping.anonymize_ipv4("192.0.2.1")
+ and same.anonymize_ipv6("2001:db8:1::1") ==
+ mapping.anonymize_ipv6("2001:db8:1::1")
+ and other.anonymize_ipv4("192.0.2.1") != mapping.anonymize_ipv4("192.0.2.1"))
+
+############
++ Offline pcap anonymization
+
+= Build the test capture
+~ prefixanon
+
+eth = dict(src="00:11:22:33:44:55", dst="66:77:88:99:aa:bb")
+pkts = [
+    Ether(**eth) / IP(src="192.0.2.1", dst="198.51.100.2") /
+        TCP(sport=1234, dport=80, flags="S", seq=1) / b"payload",
+    Ether(**eth) / IP(src="192.0.2.1", dst="198.51.100.2") /
+        UDP(sport=53, dport=53) / b"\x00\x01dns",
+    Ether(**eth) / IP(src="203.0.113.5", dst="192.0.2.1") /
+        ICMP(type=3, code=3) /
+        IP(src="192.0.2.1", dst="198.51.100.2") / UDP(sport=1, dport=2),
+    Ether(**eth) / IPv6(src="2001:db8:1::1", dst="2001:db8:2::2") /
+        ICMPv6DestUnreach() /
+        IPv6(src="2001:db8:2::2", dst="2001:db8:1::1") /
+        UDP(sport=1, dport=2),
+    Ether(**eth) / ARP(op=1, psrc="192.0.2.1", pdst="192.0.2.254",
+                       hwsrc="00:11:22:33:44:55"),
+    Ether(**eth) / IP(src="10.0.0.1", dst="10.0.0.2", flags="MF") /
+        UDP(sport=1, dport=2) / b"fragdata",
+]
+for i, p in enumerate(pkts):
+    p.time = 1700000000 + i
+
+infile = get_temp_file(autoext=".pcap")
+outfile = get_temp_file(autoext=".pcap")
+wrpcap(infile, pkts)
+report = anonymize_pcap(infile, outfile, key=KEY)
+out = rdpcap(outfile)
+(report.packets_total == 6 and report.packets_anonymized == 6
+ and len(out) == 6)
+
+= TCP, UDP and ICMP checksums are recomputed
+~ prefixanon
+
+# TCP packet: IP and TCP checksums are valid after re-parsing
+p = out[0]
+raw = bytes(p)
+del p[IP].chksum
+del p[TCP].chksum
+tcp_ok = bytes(p) == raw
+
+# UDP packet: IP checksum, UDP checksum and length are valid
+p = out[1]
+raw = bytes(p)
+del p[IP].chksum
+del p[UDP].chksum
+del p[UDP].len
+udp_ok = bytes(p) == raw
+
+# ICMP error: ICMP checksum and quoted IP header checksum are valid
+p = out[2]
+raw = bytes(p)
+del p[IP].chksum
+del p[ICMP].chksum
+del p[IPerror].chksum
+icmp_ok = bytes(p) == raw
+
+# ICMPv6 error: checksum covers the anonymized quoted packet
+p = out[3]
+raw = bytes(p)
+del p[ICMPv6DestUnreach].cksum
+icmpv6_ok = bytes(p) == raw
+
+tcp_ok and udp_ok and icmp_ok and icmpv6_ok
+
+= Addresses are mapped consistently everywhere
+~ prefixanon
+
+# the address shared by the outer IP, the ICMP-quoted inner packet
+# and the ARP protocol address gets the same mapped value
+mapped = mapping.anonymize_ipv4("192.0.2.1")
+(out[0][IP].src == mapped
+ and out[2][IPerror].src == mapped
+ and out[4][ARP].psrc == mapped
+ and out[3][IPerror6].dst == mapping.anonymize_ipv6("2001:db8:1::1"))
+
+= MAC addresses and payloads are untouched
+~ prefixanon
+
+(out[0][Ether].src == "00:11:22:33:44:55"
+ and out[0][Ether].dst == "66:77:88:99:aa:bb"
+ and bytes(out[0][TCP].payload) == b"payload"
+ and out[4][ARP].hwsrc == "00:11:22:33:44:55")
+
+= Fragmented packets are recorded and their checksum zeroed
+~ prefixanon
+
+(any(r.reason == "fragmented" and r.packet == 5 for r in report.records)
+ and out[5][UDP].chksum == 0
+ and out[5][IP].src == mapping.anonymize_ipv4("10.0.0.1"))
+
+= Truncated packets are recorded and their checksum zeroed
+~ prefixanon
+
+full = bytes(Ether(**eth) / IP(src="10.9.9.9", dst="10.9.9.8") /
+             TCP(sport=1, dport=2, flags="S") / (b"X" * 100))
+truncfile = get_temp_file(autoext=".pcap")
+truncout = get_temp_file(autoext=".pcap")
+w = RawPcapWriter(truncfile, linktype=1)
+w.write_header(None)
+w._write_packet(full[:60], linktype=1, sec=1700000007, usec=1,
+                caplen=60, wirelen=len(full))
+w.close()
+treport = anonymize_pcap(truncfile, truncout, key=KEY)
+tout = rdpcap(truncout)
+(any(r.reason == "truncated" for r in treport.records)
+ and tout[0][TCP].chksum == 0
+ and tout[0][IP].src == mapping.anonymize_ipv4("10.9.9.9"))
+
+= The key is not written to the output and runs are repeatable
+~ prefixanon
+
+outfile2 = get_temp_file(autoext=".pcap")
+anonymize_pcap(infile, outfile2, key=KEY)
+data = open(outfile, "rb").read()
+(KEY not in data
+ and data == open(outfile2, "rb").read())
