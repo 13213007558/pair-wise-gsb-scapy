@@ -634,6 +634,172 @@ with no_debug_dissector(reverse=True):
 split_layers(TCP, CustomPacket, sport=12345)
 
 
+############
+############
++ TCPSession overlap policies
+
+= Overlap policies: first-seen, last-seen, reject-conflict
+~ tcp
+
+class OLPacket(Packet):
+    fields_desc = [
+        ByteField("len", 0),
+        StrLenField("a", 0, length_from=lambda pkt: pkt.len - 1),
+    ]
+    @classmethod
+    def tcp_reassemble(cls, data, metadata, session):
+        length = struct.unpack("!B", data[:1])[0]
+        if len(data) < length:
+            return None
+        return OLPacket(data)
+
+
+bind_layers(TCP, OLPacket, sport=12346)
+bind_layers(TCP, OLPacket, dport=12346)
+
+
+def _overlap_pkt(seq, data, sport=12346, dport=12,
+                 src="2.2.2.2", dst="1.1.1.1", flags="PA"):
+    pkt = IP(dst=dst, src=src) / TCP(sport=sport, dport=dport,
+                                     seq=seq, flags=flags)
+    return pkt / data if data else pkt
+
+
+def _overlap_stream():
+    # seq 1-3: "\x05ab", seq 2-3: "XY" (conflicting overlap), seq 4-5: "cd"
+    return [
+        _overlap_pkt(1, b"\x05ab"),
+        _overlap_pkt(2, b"XY"),
+        _overlap_pkt(4, b"cd"),
+    ]
+
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(policy="first-seen")
+    pkts = sniff(offline=_overlap_stream(), session=sess)
+    assert pkts[0][OLPacket].a == b"abcd", "first-seen failure"
+    assert len(sess.conflicts) == 1
+    conflict = sess.conflicts[0]
+    assert (conflict.start, conflict.end) == (2, 4)
+    assert conflict.old_source == "2.2.2.2:12346 > 1.1.1.1:12 (seq 1)"
+    assert conflict.new_source == "2.2.2.2:12346 > 1.1.1.1:12 (seq 2)"
+    assert conflict.resolution == "first-seen"
+    # same packets, last-seen policy
+    sess = TCPSession(policy="last-seen")
+    pkts = sniff(offline=_overlap_stream(), session=sess)
+    assert pkts[0][OLPacket].a == b"XYcd", "last-seen failure"
+    assert sess.conflicts[0].resolution == "last-seen"
+    # same packets, reject-conflict policy
+    sess = TCPSession(policy="reject-conflict")
+    pkts = sniff(offline=_overlap_stream(), session=sess)
+    assert all(OLPacket not in pkt for pkt in pkts), "reject-conflict failure"
+    assert len(sess.conflicts) == 1
+    assert sess.conflicts[0].resolution == "rejected"
+
+= Overlap across the 2^32 sequence number wrap
+~ tcp
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(policy="last-seen")
+    pkts = sniff(offline=[
+        _overlap_pkt(0xfffffffe, b"\x05ab"),
+        _overlap_pkt(0xffffffff, b"XY"),
+        _overlap_pkt(1, b"cd"),
+    ], session=sess)
+    assert pkts[0][OLPacket].a == b"XYcd", "wrap last-seen failure"
+    conflict = sess.conflicts[0]
+    assert (conflict.start, conflict.end) == (0xffffffff, 1)
+    sess = TCPSession(policy="first-seen")
+    pkts = sniff(offline=[
+        _overlap_pkt(0xfffffffe, b"\x05ab"),
+        _overlap_pkt(0xffffffff, b"XY"),
+        _overlap_pkt(1, b"cd"),
+    ], session=sess)
+    assert pkts[0][OLPacket].a == b"abcd", "wrap first-seen failure"
+
+= Overlap policies apply to each direction independently
+~ tcp
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(policy="last-seen")
+    pkts = sniff(offline=[
+        _overlap_pkt(1, b"\x05ab"),
+        _overlap_pkt(10, b"\x05xy", sport=12, dport=12346,
+                     src="1.1.1.1", dst="2.2.2.2"),
+        _overlap_pkt(2, b"XY"),
+        _overlap_pkt(11, b"ZW", sport=12, dport=12346,
+                     src="1.1.1.1", dst="2.2.2.2"),
+        _overlap_pkt(4, b"cd"),
+        _overlap_pkt(13, b"uv", sport=12, dport=12346,
+                     src="1.1.1.1", dst="2.2.2.2"),
+    ], session=sess)
+    got = sorted(pkt[OLPacket].a for pkt in pkts if OLPacket in pkt)
+    assert got == [b"XYcd", b"ZWuv"], "per-direction failure"
+    assert len(sess.conflicts) == 2
+    sources = sorted(conflict.old_source for conflict in sess.conflicts)
+    assert sources[0].startswith("1.1.1.1:12 > 2.2.2.2:12346")
+    assert sources[1].startswith("2.2.2.2:12346 > 1.1.1.1:12")
+
+= Reused connections are reassembled separately
+~ tcp
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession()
+    pkts = sniff(offline=[
+        _overlap_pkt(100, b"", flags="S"),
+        _overlap_pkt(101, b"\x05ab"),
+        _overlap_pkt(104, b"cd"),
+        # same 4-tuple, new connection with a new initial sequence number
+        _overlap_pkt(5000, b"", flags="S"),
+        _overlap_pkt(5001, b"\x05xy"),
+        _overlap_pkt(5004, b"zw"),
+    ], session=sess)
+    got = [pkt[OLPacket].a for pkt in pkts if OLPacket in pkt]
+    assert got == [b"abcd", b"xyzw"], "connection reuse failure"
+
+= Reassembly terminates when the buffer exceeds its bounds
+~ tcp
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(max_buffer=8)
+    pkts = sniff(offline=[
+        _overlap_pkt(1, b"\x64aaa"),  # announces 100 bytes: stays buffered
+        _overlap_pkt(5, b"bbbb"),
+        _overlap_pkt(9, b"cccc"),  # exceeds max_buffer: direction terminated
+        _overlap_pkt(13, b"dddd"),
+    ], session=sess)
+    assert all(OLPacket not in pkt for pkt in pkts)
+    # the packets of the terminated direction are not reassembled anymore
+    assert len(pkts) == 2
+
+= Holes are not zero-filled, identical retransmissions are not conflicts
+~ tcp
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession()
+    pkts = sniff(offline=[
+        _overlap_pkt(1, b"\x05a"),
+        _overlap_pkt(4, b"cd"),  # gap at seq 3: nothing is reassembled
+    ], session=sess)
+    assert not pkts, "hole was zero-filled"
+    # out-of-order hole filling
+    pkts = sniff(offline=[_overlap_pkt(3, b"b")], session=sess)
+    assert pkts[0][OLPacket].a == b"abcd", "hole filling failure"
+    # full and partial retransmissions with identical content
+    sess = TCPSession(policy="reject-conflict")
+    pkts = sniff(offline=[
+        _overlap_pkt(1, b"\x05ab"),
+        _overlap_pkt(1, b"\x05ab"),
+        _overlap_pkt(2, b"ab"),
+        _overlap_pkt(3, b"bcd"),
+    ], session=sess)
+    assert pkts[0][OLPacket].a == b"abcd", "retransmission failure"
+    assert not sess.conflicts
+
+split_layers(TCP, OLPacket, sport=12346)
+split_layers(TCP, OLPacket, dport=12346)
+
+
 = Layer binding
 
 * Test DestMACField & DestIPField

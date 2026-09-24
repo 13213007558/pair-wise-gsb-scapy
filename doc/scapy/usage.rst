@@ -849,6 +849,17 @@ The ``data`` argument is bytes and the ``metadata`` argument is a dictionary whi
 
 If ``tcp_reassemble`` **returns any padding**, it will be kept for the next payload.
 
+Only the contiguous data of a stream is passed to ``tcp_reassemble``: missing
+fragments (holes) are never zero-filled. When TCP segments overlap with a
+different content, the ``policy`` argument of ``TCPSession`` selects which
+copy is used: ``first-seen`` keeps the bytes received first, ``last-seen``
+(the default) keeps the most recent ones and ``reject-conflict`` stops
+reassembling the direction. Detected conflicts are reported in the
+``conflicts`` attribute of the session, with the origin of both segments
+and the conflicting sequence number range. The ``max_buffer`` argument
+bounds the size of the reassembly buffer of each direction: the reassembly
+of a direction is explicitly terminated once its buffer would exceed it.
+
 Filters
 -------
 
@@ -1899,6 +1910,5 @@ For example to guess OS from a single captured packet:
     192.168.1.100:54716 - Linux 2.6 (newer, 1) (up: 24 hrs)
       -> 74.125.19.104:www (distance 0)
     <Sniffed: TCP:339 UDP:2 ICMP:0 Other:156>
-
 
 
