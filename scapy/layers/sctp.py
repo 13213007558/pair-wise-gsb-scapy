@@ -9,6 +9,8 @@ SCTP (Stream Control Transmission Protocol).
 """
 
 import struct
+import hashlib
+import hmac
 
 from scapy.compat import raw
 from scapy.volatile import RandBin
@@ -889,6 +891,250 @@ class SCTPChunkPad(_SCTPChunkGuessPayload, Packet):
 
 class SCTPChunkAddressConfAck(SCTPChunkAddressConf):
     type = 0x80
+
+
+# SCTP authentication (RFC 4895)
+
+# HMAC identifiers usable in the AUTH chunk, mapped to their hash
+# constructor.
+sctp_hmac_identifiers = {
+    1: ("SHA-1", hashlib.sha1),
+    3: ("SHA-256", hashlib.sha256),
+}
+
+
+class SCTPAuthError(Exception):
+    """Raised when an SCTP packet cannot be signed (RFC 4895)."""
+
+
+def _sctp_auth_param_bytes(param):
+    """
+    Return the bytes of a RANDOM, CHUNKS or HMAC-ALGO parameter as
+    exchanged in INIT and INIT-ACK chunks, padding included.
+    """
+    if param is None:
+        return b""
+    if isinstance(param, Packet):
+        return raw(param)
+    return bytes(param)
+
+
+def _sctp_auth_concat(vector1, vector2):
+    """Concatenate two byte vectors, the smallest one first."""
+    if vector2 < vector1:
+        vector1, vector2 = vector2, vector1
+    return vector1 + vector2
+
+
+def _sctp_auth_hmac_ids(param):
+    """Return the HMAC identifiers listed in a HMAC-ALGO parameter."""
+    if len(param) < 4:
+        return []
+    length = min(struct.unpack(">H", param[2:4])[0], len(param))
+    return [struct.unpack(">H", param[i:i + 2])[0]
+            for i in range(4, length - 1, 2)]
+
+
+def _sctp_auth_chunk_types(param):
+    """Return the chunk types listed in a CHUNKS parameter."""
+    if len(param) < 4:
+        return []
+    length = min(struct.unpack(">H", param[2:4])[0], len(param))
+    return list(param[4:length])
+
+
+def _sctp_chunk_spans(data):
+    """
+    Iterate over the chunks of a serialized SCTP packet.
+
+    Yield (offset, type, length) tuples, where length is the chunk
+    length without its padding.
+    """
+    offset = 12  # size of the SCTP common header
+    while offset + 4 <= len(data):
+        length = struct.unpack(">H", data[offset + 2:offset + 4])[0]
+        if length < 4 or offset + length > len(data):
+            break
+        yield offset, data[offset], length
+        offset += (length + 3) & ~3
+
+
+def _sctp_auth_check_positions(data, protected_types):
+    """
+    Check that all chunks of protected_types are located after the
+    AUTH chunk.  Return None on success, an error message otherwise.
+    """
+    auth_seen = False
+    for _, chunk_type, _ in _sctp_chunk_spans(data):
+        if chunk_type == 15:  # authentication
+            auth_seen = True
+        elif chunk_type in protected_types and not auth_seen:
+            return ("the %s chunk requires authentication and MUST be "
+                    "sent after the AUTH chunk"
+                    % sctpchunktypes.get(chunk_type, str(chunk_type)))
+    return None
+
+
+def _sctp_auth_hmac_hashfn(hmac_id, negotiated_ids):
+    """
+    Return the hash constructor of a negotiated HMAC identifier.
+    """
+    if hmac_id not in negotiated_ids:
+        raise SCTPAuthError(
+            "HMAC identifier %d was not negotiated for this association"
+            % hmac_id)
+    try:
+        return sctp_hmac_identifiers[hmac_id][1]
+    except KeyError:
+        raise SCTPAuthError("unsupported HMAC identifier %d" % hmac_id)
+
+
+class SCTPAuthAssociation:
+    r"""
+    Offline authentication state of an SCTP association (RFC 4895).
+
+    The association shared key is derived from the shared keys of both
+    endpoints and from the RANDOM, CHUNKS and HMAC-ALGO parameters
+    exchanged in the INIT and INIT-ACK chunks (RFC 4895, Section 6.1):
+
+    - the endpoint pair shared key is the concatenation of the local
+      and remote shared keys, the key with the smaller shared key
+      identifier first,
+    - the association shared key is the concatenation of the endpoint
+      pair shared key, both RANDOM parameters, both CHUNKS parameters
+      and both HMAC-ALGO parameters, the two vectors of each pair
+      being concatenated smallest first.  The parameters include
+      their padding.
+
+    The parameters are provided by the caller, either as bytes or as
+    SCTPChunkParamRandom, SCTPChunkParamChunkList and
+    SCTPChunkParamRequestedHMACFunctions packets.  This class only
+    performs byte-level authentication of packets: it does not take
+    part in any handshake and does not exchange packets with a peer.
+    """
+
+    def __init__(self, local_key_id=0, local_key=b"",
+                 remote_key_id=0, remote_key=b"",
+                 local_random=None, remote_random=None,
+                 local_chunks=None, remote_chunks=None,
+                 local_hmacs=None, remote_hmacs=None):
+        self.local_key_id = local_key_id
+        self.remote_key_id = remote_key_id
+        local_key = local_key or b""
+        remote_key = remote_key or b""
+        local_random = _sctp_auth_param_bytes(local_random)
+        remote_random = _sctp_auth_param_bytes(remote_random)
+        local_chunks = _sctp_auth_param_bytes(local_chunks)
+        remote_chunks = _sctp_auth_param_bytes(remote_chunks)
+        local_hmacs = _sctp_auth_param_bytes(local_hmacs)
+        remote_hmacs = _sctp_auth_param_bytes(remote_hmacs)
+        if local_key_id <= remote_key_id:
+            pair_key = local_key + remote_key
+        else:
+            pair_key = remote_key + local_key
+        self.assoc_key = (
+            pair_key +
+            _sctp_auth_concat(local_random, remote_random) +
+            _sctp_auth_concat(local_chunks, remote_chunks) +
+            _sctp_auth_concat(local_hmacs, remote_hmacs)
+        )
+        self.local_hmac_ids = _sctp_auth_hmac_ids(local_hmacs)
+        self.remote_hmac_ids = _sctp_auth_hmac_ids(remote_hmacs)
+        self.local_chunk_types = _sctp_auth_chunk_types(local_chunks)
+        self.remote_chunk_types = _sctp_auth_chunk_types(remote_chunks)
+
+    def sign(self, pkt, shared_key_id=None, hmac_id=None):
+        """
+        Sign the SCTP packet pkt, which contains an
+        SCTPChunkAuthentication chunk, and return its bytes.
+
+        The HMAC is computed over the SCTP common header (with the
+        checksum field set to zero) and all the chunks, the HMAC field
+        of the AUTH chunk being set to zero (RFC 4895, Section 6.3).
+        The CRC32c checksum is computed afterwards, over the
+        authenticated packet, and does not alter the authentication.
+
+        shared_key_id and hmac_id override the corresponding fields of
+        the AUTH chunk when provided.
+        """
+        if not isinstance(pkt, Packet):
+            pkt = SCTP(bytes(pkt))
+        pkt = pkt.copy()
+        auth = pkt.getlayer(SCTPChunkAuthentication)
+        if auth is None:
+            raise SCTPAuthError(
+                "the packet contains no SCTPChunkAuthentication chunk")
+        if shared_key_id is not None:
+            auth.shared_key_id = shared_key_id
+        if hmac_id is not None:
+            auth.HMAC_function = hmac_id
+        if auth.shared_key_id != self.local_key_id:
+            raise SCTPAuthError(
+                "no shared key with identifier %d for this association"
+                % auth.shared_key_id)
+        hashfn = _sctp_auth_hmac_hashfn(auth.HMAC_function,
+                                        self.remote_hmac_ids)
+        auth.HMAC = b"\x00" * hashfn().digest_size
+        pkt.chksum = 0
+        data = bytearray(raw(pkt))
+        error = _sctp_auth_check_positions(data, self.remote_chunk_types)
+        if error:
+            raise SCTPAuthError(error)
+        offset = next(off for off, ctype, _ in _sctp_chunk_spans(data)
+                      if ctype == 15)
+        signature = hmac.new(self.assoc_key, bytes(data), hashfn)
+        data[offset + 8:offset + 8 + signature.digest_size] = \
+            signature.digest()
+        data[8:12] = struct.pack(">I", crc32c(bytes(data)))
+        return bytes(data)
+
+    def verify(self, pkt):
+        """
+        Verify the SCTP packet pkt against its AUTH chunk.
+
+        Return (True, None) if the packet is authentic, (False,
+        reason) otherwise.  The CRC32c checksum is not part of the
+        authentication and is not verified.
+        """
+        if isinstance(pkt, Packet):
+            data = raw(pkt)
+        else:
+            data = bytes(pkt)
+        auth_span = None
+        for span in _sctp_chunk_spans(data):
+            if span[1] == 15:  # authentication
+                auth_span = span
+                break
+        if auth_span is None:
+            return False, "the packet contains no AUTH chunk"
+        error = _sctp_auth_check_positions(data, self.local_chunk_types)
+        if error:
+            return False, error
+        offset, _, length = auth_span
+        shared_key_id, hmac_id = struct.unpack(
+            ">HH", data[offset + 4:offset + 8])
+        if shared_key_id != self.remote_key_id:
+            return (False,
+                    "no shared key with identifier %d for this "
+                    "association" % shared_key_id)
+        if hmac_id not in self.local_hmac_ids:
+            return (False, "HMAC identifier %d was not negotiated for "
+                    "this association" % hmac_id)
+        if hmac_id not in sctp_hmac_identifiers:
+            return False, "unsupported HMAC identifier %d" % hmac_id
+        name, hashfn = sctp_hmac_identifiers[hmac_id]
+        hmac_length = length - 8
+        if hmac_length != hashfn().digest_size:
+            return (False, "invalid HMAC length %d for %s"
+                    % (hmac_length, name))
+        data = bytearray(data)
+        received = bytes(data[offset + 8:offset + 8 + hmac_length])
+        data[8:12] = b"\x00" * 4
+        data[offset + 8:offset + 8 + hmac_length] = b"\x00" * hmac_length
+        expected = hmac.new(self.assoc_key, bytes(data), hashfn)
+        if hmac.compare_digest(received, expected.digest()):
+            return True, None
+        return False, "HMAC verification failed"
 
 
 bind_layers(IP, SCTP, proto=IPPROTO_SCTP)

@@ -331,3 +331,137 @@ assert param1.random != param2.random
 p1 = IP(raw(IP(src=RandIP(), dst=RandIP()) / SCTP(sport=RandShort(), dport=RandShort())))
 p2 = IP(raw(IP(src=RandIP(), dst=p1[IP].src) / ICMP(type=3, code=1) / p1))
 assert p2.answers(p1)
+
+############
++ SCTP Authentication (RFC 4895)
+
+= SCTP AUTH - association shared key derivation
+~ sctp auth
+from scapy.layers.sctp import SCTPAuthAssociation, SCTPAuthError, crc32c
+import hashlib
+import hmac as hmac_mod
+import struct
+local_random = SCTPChunkParamRandom(random=bytes(range(0x20)))
+remote_random = SCTPChunkParamRandom(random=bytes(range(0x20, 0x40)))
+local_chunks = SCTPChunkParamChunkList(chunk_list=[64])
+remote_chunks = SCTPChunkParamChunkList(chunk_list=[0])
+local_hmacs = SCTPChunkParamRequestedHMACFunctions(HMAC_functions_list=["SHA-1", "SHA-256"])
+remote_hmacs = SCTPChunkParamRequestedHMACFunctions(HMAC_functions_list=["SHA-256"])
+assoc = SCTPAuthAssociation(local_key_id=1, local_key=b"local-secret",
+                            remote_key_id=2, remote_key=b"remote-secret",
+                            local_random=local_random, remote_random=remote_random,
+                            local_chunks=local_chunks, remote_chunks=remote_chunks,
+                            local_hmacs=local_hmacs, remote_hmacs=remote_hmacs)
+assoc_b = SCTPAuthAssociation(local_key_id=2, local_key=b"remote-secret",
+                              remote_key_id=1, remote_key=b"local-secret",
+                              local_random=remote_random, remote_random=local_random,
+                              local_chunks=remote_chunks, remote_chunks=local_chunks,
+                              local_hmacs=remote_hmacs, remote_hmacs=local_hmacs)
+expected = (b"local-secret" + b"remote-secret" +
+            raw(local_random) + raw(remote_random) +
+            raw(remote_chunks) + raw(local_chunks) +
+            raw(remote_hmacs) + raw(local_hmacs))
+assert assoc.assoc_key == expected
+assert assoc_b.assoc_key == expected
+assert assoc.local_hmac_ids == [1, 3]
+assert assoc.remote_hmac_ids == [3]
+assert assoc.local_chunk_types == [64]
+assert assoc.remote_chunk_types == [0]
+
+= SCTP AUTH - sign and verify with SHA-256
+~ sctp auth
+pkt = (SCTP(sport=5000, dport=5001, tag=0x01020304) /
+       SCTPChunkAuthentication(shared_key_id=1, HMAC_function=3) /
+       SCTPChunkData(tsn=10, stream_id=2, stream_seq=3, data=b"hello"))
+signed = assoc.sign(pkt)
+assert signed == bytes.fromhex(
+    "1388138901020304eb7acd47"
+    "0f0000280001000344c8b4ab6e8cc195b09f8a56879269a3cf571708e07170d13c963e46d87d7b05"
+    "000000150000000a000200030000000068656c6c6f000000")
+ok, reason = assoc_b.verify(signed)
+assert ok, reason
+
+= SCTP AUTH - manual recomputation of the HMAC and CRC32c
+~ sctp auth
+d = bytearray(signed)
+d[8:12] = b"\x00" * 4
+d[20:52] = b"\x00" * 32
+expected_hmac = hmac_mod.new(assoc.assoc_key, bytes(d), hashlib.sha256).digest()
+assert expected_hmac == signed[20:52]
+d = bytearray(signed)
+d[8:12] = b"\x00" * 4
+assert crc32c(bytes(d)) == struct.unpack(">I", signed[8:12])[0]
+
+= SCTP AUTH - sign and verify with SHA-1
+~ sctp auth
+pkt = (SCTP(sport=5001, dport=5000, tag=9) /
+       SCTPChunkAuthentication(shared_key_id=2, HMAC_function=1) /
+       SCTPChunkData(tsn=1, stream_id=1, stream_seq=1, data=b"x"))
+signed_sha1 = assoc_b.sign(pkt)
+assert signed_sha1 == bytes.fromhex(
+    "13891388000000092ca2f70f"
+    "0f00001c00020001cd4dbfadf07f64e9dd11d6f7e0831471d8ac22aa"
+    "0000001100000001000100010000000078000000")
+ok, reason = assoc.verify(signed_sha1)
+assert ok, reason
+
+= SCTP AUTH - swapped protected chunks are rejected
+~ sctp auth
+pkt = (SCTP(sport=5000, dport=5001, tag=5) /
+       SCTPChunkAuthentication(shared_key_id=1, HMAC_function=3) /
+       SCTPChunkData(tsn=1, stream_id=1, stream_seq=1, data=b"aaaa") /
+       SCTPChunkData(tsn=2, stream_id=1, stream_seq=2, data=b"bbbb"))
+signed2 = assoc.sign(pkt)
+# the AUTH chunk is 40 bytes long, each DATA chunk is 20 bytes long
+swapped = signed2[:52] + signed2[72:] + signed2[52:72]
+ok, reason = assoc_b.verify(swapped)
+assert not ok and reason == "HMAC verification failed"
+
+= SCTP AUTH - modified padding is rejected
+~ sctp auth
+# the DATA chunk of signed is padded with 3 bytes
+bad = bytearray(signed)
+bad[-1] ^= 0xff
+ok, reason = assoc_b.verify(bytes(bad))
+assert not ok and reason == "HMAC verification failed"
+
+= SCTP AUTH - modified shared key identifier is rejected
+~ sctp auth
+bad = bytearray(signed)
+bad[16:18] = struct.pack(">H", 7)
+ok, reason = assoc_b.verify(bytes(bad))
+assert not ok and "shared key" in reason
+try:
+    assoc.sign(SCTP() / SCTPChunkAuthentication(shared_key_id=7,
+                                                HMAC_function=3))
+    assert False
+except SCTPAuthError as ex:
+    assert "shared key" in str(ex)
+
+= SCTP AUTH - unnegotiated HMAC algorithm is rejected
+~ sctp auth
+try:
+    assoc.sign(SCTP() / SCTPChunkAuthentication(shared_key_id=1,
+                                                HMAC_function=1))
+    assert False
+except SCTPAuthError as ex:
+    assert "not negotiated" in str(ex)
+
+bad = bytearray(signed)
+bad[18:20] = struct.pack(">H", 1)
+ok, reason = assoc_b.verify(bytes(bad))
+assert not ok and "not negotiated" in reason
+
+= SCTP AUTH - protected chunk before the AUTH chunk is rejected
+~ sctp auth
+pkt = (SCTP() /
+       SCTPChunkData(tsn=1, stream_id=1, stream_seq=1, data=b"zz") /
+       SCTPChunkAuthentication(shared_key_id=1, HMAC_function=3))
+try:
+    assoc.sign(pkt)
+    assert False
+except SCTPAuthError as ex:
+    assert "after the AUTH chunk" in str(ex)
+
+ok, reason = assoc_b.verify(raw(pkt))
+assert not ok and "after the AUTH chunk" in reason
