@@ -9,6 +9,7 @@ General utility functions.
 
 
 from decimal import Decimal
+from fractions import Fraction
 from io import StringIO
 from itertools import zip_longest
 from uuid import UUID
@@ -20,6 +21,7 @@ import decimal
 import difflib
 import enum
 import gzip
+import heapq
 import inspect
 import locale
 import math
@@ -1662,7 +1664,8 @@ class RawPcapNgReader(RawPcapReader):
                                             ["linktype", "tsresol",
                                              "tshigh", "tslow", "wirelen",
                                              "comments", "ifname", "direction",
-                                             "process_information"])
+                                             "process_information",
+                                             "tsoffset"])
 
     def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
         # type: (str, IO[bytes], bytes) -> None
@@ -1671,8 +1674,13 @@ class RawPcapNgReader(RawPcapReader):
         # A list of (linktype, snaplen, tsresol); will be populated by IDBs.
         self.interfaces = []  # type: List[Tuple[int, int, Dict[str, Any]]]
         self.default_options = {
-            "tsresol": 1000000
+            "tsresol": 1000000,
+            "tsoffset": 0
         }
+        # Index of the current section (SHB), starting at 0
+        self.section_index = -1
+        # Interface id of the last packet block read
+        self.current_intid = None  # type: Optional[int]
         self.blocktypes: Dict[
             int,
             Callable[
@@ -1729,7 +1737,12 @@ class RawPcapNgReader(RawPcapReader):
         self._read_block_tail(blocklen)
         if blocktype in self.blocktypes:
             return self.blocktypes[blocktype](block, size)
+        self._read_block_unknown(blocktype, block)
         return None
+
+    def _read_block_unknown(self, blocktype, block):
+        # type: (int, bytes) -> None
+        """Called on blocks of unknown type. Does nothing by default."""
 
     def _read_block_tail(self, blocklen):
         # type: (int) -> None
@@ -1748,6 +1761,10 @@ class RawPcapNgReader(RawPcapReader):
     def _read_block_shb(self):
         # type: () -> None
         """Section Header Block"""
+        # Interface numbering and process information are per-section
+        self.section_index += 1
+        self.interfaces = []
+        self.process_information = []
         _blocklen = self.f.read(4)
         endian = self.f.read(4)
         if endian == b"\x1a\x2b\x3c\x4d":
@@ -1861,6 +1878,14 @@ class RawPcapNgReader(RawPcapReader):
                 else:
                     warning("PcapNg: invalid options "
                             "length %d for IDB tsresol" % length)
+            elif c == 14:
+                if len(v) == 8:
+                    options["tsoffset"] = struct.unpack(
+                        self.endian + "q", v
+                    )[0]
+                else:
+                    warning("PcapNg: invalid options "
+                            "length %d for IDB tsoffset" % len(v))
             elif c == 2:
                 options["name"] = v
             elif c == 1:
@@ -1940,6 +1965,7 @@ class RawPcapNgReader(RawPcapReader):
         if not self._check_interface_id(intid):
             return None
         ifname = self.interfaces[intid][2].get('name', None)
+        self.current_intid = intid
 
         return (block[20:20 + caplen][:size],
                 RawPcapNgReader.PacketMetadata(linktype=self.interfaces[intid][0],  # noqa: E501
@@ -1950,7 +1976,8 @@ class RawPcapNgReader(RawPcapReader):
                                                ifname=ifname,
                                                direction=direction,
                                                process_information=process_information,
-                                               comments=comments))
+                                               comments=comments,
+                                               tsoffset=self.interfaces[intid][2]['tsoffset']))  # noqa: E501
 
     def _read_block_spb(self, block, size):
         # type: (bytes, int) -> Optional[Tuple[bytes, RawPcapNgReader.PacketMetadata]]  # noqa: E501
@@ -1961,6 +1988,7 @@ class RawPcapNgReader(RawPcapReader):
         intid = 0
         if not self._check_interface_id(intid):
             return None
+        self.current_intid = intid
 
         try:
             wirelen, = struct.unpack(self.endian + "I", block[:4])
@@ -1978,7 +2006,8 @@ class RawPcapNgReader(RawPcapReader):
                                                ifname=None,
                                                direction=None,
                                                process_information={},
-                                               comments=None))
+                                               comments=None,
+                                               tsoffset=self.interfaces[intid][2]['tsoffset']))  # noqa: E501
 
     def _read_block_pkt(self, block, size):
         # type: (bytes, int) -> Optional[Tuple[bytes, RawPcapNgReader.PacketMetadata]]  # noqa: E501
@@ -1994,6 +2023,7 @@ class RawPcapNgReader(RawPcapReader):
 
         if not self._check_interface_id(intid):
             return None
+        self.current_intid = intid
         return (block[20:20 + caplen][:size],
                 RawPcapNgReader.PacketMetadata(linktype=self.interfaces[intid][0],  # noqa: E501
                                                tsresol=self.interfaces[intid][2]['tsresol'],  # noqa: E501
@@ -2003,7 +2033,8 @@ class RawPcapNgReader(RawPcapReader):
                                                ifname=None,
                                                direction=None,
                                                process_information={},
-                                               comments=None))
+                                               comments=None,
+                                               tsoffset=self.interfaces[intid][2]['tsoffset']))  # noqa: E501
 
     def _read_block_dsb(self, block, size):
         # type: (bytes, int) -> None
@@ -2115,7 +2146,7 @@ class PcapNgReader(RawPcapNgReader, PcapReader):
         rp = super(PcapNgReader, self)._read_packet(size=size)
         if rp is None:
             raise EOFError
-        s, (linktype, tsresol, tshigh, tslow, wirelen, comments, ifname, direction, process_information) = rp  # noqa: E501
+        s, (linktype, tsresol, tshigh, tslow, wirelen, comments, ifname, direction, process_information, tsoffset) = rp  # noqa: E501
         try:
             cls = conf.l2types.num2layer[linktype]  # type: Type[Packet]
             p = cls(s, **kwargs)  # type: Packet
@@ -2129,7 +2160,7 @@ class PcapNgReader(RawPcapNgReader, PcapReader):
                 import scapy.packet  # noqa: F401
             p = conf.raw_layer(s)
         if tshigh is not None:
-            p.time = EDecimal((tshigh << 32) + tslow) / tsresol
+            p.time = EDecimal((tshigh << 32) + tslow) / tsresol + tsoffset
         p.wirelen = wirelen
         p.comments = comments
         p.direction = direction
@@ -2550,7 +2581,11 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
     def _write_block_idb(self,
                          linktype,  # type: int
-                         ifname=None  # type: Optional[bytes]
+                         ifname=None,  # type: Optional[bytes]
+                         snaplen=262144,  # type: int
+                         tsresol=None,  # type: Optional[int]
+                         tsoffset=None,  # type: Optional[int]
+                         comment=None,  # type: Optional[bytes]
                          ):
         # type: (...) -> None
 
@@ -2561,25 +2596,46 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         # Reserved
         block_idb += struct.pack(self.endian + "H", 0)
         # SnapLen
-        block_idb += struct.pack(self.endian + "I", 262144)
+        block_idb += struct.pack(self.endian + "I", snaplen)
 
-        # if_name option
-        opts = None
+        # Options
+        opts = b""
+        if comment is not None:
+            # opt_comment
+            opts += struct.pack(self.endian + "HH", 1, len(comment))
+            opts += self._add_padding(comment)
         if ifname is not None:
-            opts = struct.pack(self.endian + "HH", 2, len(ifname))
-            # Pad Option Value to 32 bits
+            # if_name
+            opts += struct.pack(self.endian + "HH", 2, len(ifname))
             opts += self._add_padding(ifname)
+        if tsresol is not None:
+            # if_tsresol: MSB set means a power of 2, else a power of 10
+            if tsresol & (tsresol - 1) == 0:
+                resol = 0x80 | (tsresol.bit_length() - 1)
+            else:
+                resol = 0
+                while 10 ** resol < tsresol:
+                    resol += 1
+            opts += struct.pack(self.endian + "HH", 9, 1)
+            opts += struct.pack(self.endian + "B", resol) + b"\x00" * 3
+        if tsoffset is not None:
+            # if_tsoffset
+            opts += struct.pack(self.endian + "HH", 14, 8)
+            opts += struct.pack(self.endian + "q", tsoffset)
+        if opts:
             opts += struct.pack(self.endian + "HH", 0, 0)
 
-        self.f.write(self.build_block(block_type, block_idb, options=opts))
+        self.f.write(self.build_block(block_type, block_idb,
+                                      options=opts or None))
 
-    def _write_block_spb(self, raw_pkt):
-        # type: (bytes) -> None
+    def _write_block_spb(self, raw_pkt, wirelen=None):
+        # type: (bytes, Optional[int]) -> None
 
         # Block Type
         block_type = struct.pack(self.endian + "I", 3)
         # Original Packet Length
-        block_spb = struct.pack(self.endian + "I", len(raw_pkt))
+        block_spb = struct.pack(self.endian + "I",
+                                len(raw_pkt) if wirelen is None else wirelen)
         # Packet Data
         block_spb += raw_pkt
 
@@ -2588,16 +2644,18 @@ class RawPcapNgWriter(GenericRawPcapWriter):
     def _write_block_epb(self,
                          raw_pkt,  # type: bytes
                          ifid,  # type: int
-                         timestamp=None,  # type: Optional[Union[EDecimal, float]]  # noqa: E501
+                         timestamp=None,  # type: Optional[Union[EDecimal, float, Fraction]]  # noqa: E501
                          caplen=None,  # type: Optional[int]
                          orglen=None,  # type: Optional[int]
                          comments=None,  # type: Optional[List[bytes]]
                          flags=None,  # type: Optional[int]
+                         tsresol=None,  # type: Optional[int]
                          ):
         # type: (...) -> None
 
         if timestamp:
-            tmp_ts = int(timestamp * self.tsresol)
+            resol = self.tsresol if tsresol is None else tsresol
+            tmp_ts = int(timestamp * resol)
             ts_high = tmp_ts >> 32
             ts_low = tmp_ts & 0xFFFFFFFF
         else:
@@ -2733,6 +2791,183 @@ class PcapNgWriter(RawPcapNgWriter):
             usec = 0
 
         return sec, usec  # type: ignore
+
+
+class _PcapNgMergeReader(RawPcapNgReader):
+    """A RawPcapNgReader that collects the blocks of unknown type
+    instead of silently ignoring them.
+    """
+
+    def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
+        # type: (Union[str, IO[bytes]], IO[bytes], bytes) -> None
+        # A list of (blocktype, block body) unknown blocks
+        self.unknown_blocks = []  # type: List[Tuple[int, bytes]]
+        super(_PcapNgMergeReader, self).__init__(
+            cast(str, filename), fdesc, magic
+        )
+
+    def _read_block_unknown(self, blocktype, block):
+        # type: (int, bytes) -> None
+        self.unknown_blocks.append((blocktype, block))
+
+
+@conf.commands.register
+def merge_pcapng(output, inputs, spb="drop", unknown_blocks="drop"):
+    # type: (str, List[Union[str, IO[bytes]]], str, str) -> None
+    """Merge several pcapng files into a single one, ordered by packet
+    time.
+
+    The capture time of each packet is computed exactly, as a fraction,
+    from the tsresol and tsoffset of its interface: timestamps are never
+    converted to float, so packets that differ by less than what a float
+    can represent are still ordered correctly. Packets with identical
+    timestamps are ordered by input file order, then by their order in
+    their file.
+
+    Each section of each input file is interpreted independently
+    (endianness, interface numbering, tsresol, tsoffset), and every
+    input interface is mapped to a new interface description in the
+    output section, preserving its name, linktype, snaplen, tsresol,
+    tsoffset and comment.
+
+    The merge is streamed: at most one packet per input file is kept in
+    memory, so memory usage does not depend on the total number of
+    packets. Input files are expected to be already ordered by packet
+    time, as capture files usually are.
+
+    :param output: the name of the pcapng file to write
+    :param inputs: the pcapng files (names or file objects) to merge
+    :param spb: what to do with Simple Packet Blocks, which carry no
+        timestamp and therefore cannot be ordered: "drop" (default)
+        discards them with a warning, "keep" copies them to the output
+        (as SPB when they map to output interface 0, otherwise as EPB
+        with a null timestamp)
+    :param unknown_blocks: what to do with blocks of unknown type:
+        "drop" (default) discards them with a warning, "keep" copies
+        them verbatim to the output
+    """
+    if spb not in ("drop", "keep"):
+        raise ValueError("spb must be 'drop' or 'keep'")
+    if unknown_blocks not in ("drop", "keep"):
+        raise ValueError("unknown_blocks must be 'drop' or 'keep'")
+    readers = []  # type: List[_PcapNgMergeReader]
+    try:
+        for fname in inputs:
+            reader = _PcapNgMergeReader(fname)
+            readers.append(reader)
+        writer = RawPcapNgWriter(output)
+        try:
+            writer._write_block_shb()
+            writer.header_present = True
+            # (input file, section, interface id) -> output interface id
+            interfaces = {}  # type: Dict[Tuple[int, int, int], int]
+            heap = []  # type: List[Tuple[Fraction, int, int, bytes, Any]]
+            seq = [0] * len(readers)
+            spb_warned = [False] * len(readers)
+
+            def map_interface(idx):
+                # type: (int) -> int
+                """Map the interface of the last packet read on one
+                input to an output interface id, writing its Interface
+                Description Block if needed."""
+                reader = readers[idx]
+                intid = reader.current_intid
+                assert intid is not None
+                key = (idx, reader.section_index, intid)
+                ifid = interfaces.get(key)
+                if ifid is None:
+                    linktype, snaplen, options = reader.interfaces[intid]
+                    ifid = len(interfaces)
+                    writer._write_block_idb(
+                        linktype,
+                        ifname=options.get("name"),
+                        snaplen=snaplen,
+                        tsresol=options["tsresol"],
+                        tsoffset=options["tsoffset"] or None,
+                        comment=options.get("comment"),
+                    )
+                    interfaces[key] = ifid
+                return ifid
+
+            def flush_unknown_blocks(idx):
+                # type: (int) -> None
+                """Apply the unknown_blocks policy to the blocks
+                collected while reading one input."""
+                reader = readers[idx]
+                for blocktype, block in reader.unknown_blocks:
+                    if unknown_blocks == "keep":
+                        blocklen = len(block) + 12
+                        blocklen += -blocklen % 4
+                        writer.f.write(
+                            struct.pack(writer.endian + "II",
+                                        blocktype, blocklen) +
+                            block +
+                            b"\x00" * (blocklen - 12 - len(block)) +
+                            struct.pack(writer.endian + "I", blocklen))
+                    else:
+                        warning("merge_pcapng: dropping block of "
+                                "unknown type 0x%x", blocktype)
+                del reader.unknown_blocks[:]
+
+            def advance(idx):
+                # type: (int) -> bool
+                """Read the next timestamped packet of one input and
+                push it to the heap."""
+                reader = readers[idx]
+                while True:
+                    try:
+                        raw, metadata = reader._read_packet(
+                            size=0xffffffff)
+                    except EOFError:
+                        flush_unknown_blocks(idx)
+                        return False
+                    flush_unknown_blocks(idx)
+                    if metadata.tshigh is None:
+                        # Simple Packet Block: no timestamp
+                        if spb == "keep":
+                            ifid = map_interface(idx)
+                            if ifid == 0:
+                                writer._write_block_spb(
+                                    raw, wirelen=metadata.wirelen)
+                            else:
+                                writer._write_block_epb(
+                                    raw, ifid=ifid, caplen=len(raw),
+                                    orglen=metadata.wirelen)
+                        elif not spb_warned[idx]:
+                            spb_warned[idx] = True
+                            warning("merge_pcapng: dropping Simple "
+                                    "Packet Block(s) from input %d "
+                                    "(no timestamp)", idx)
+                        continue
+                    timestamp = Fraction(
+                        (metadata.tshigh << 32) + metadata.tslow,
+                        metadata.tsresol
+                    ) + metadata.tsoffset
+                    seq[idx] += 1
+                    heapq.heappush(
+                        heap, (timestamp, idx, seq[idx], raw, metadata))
+                    return True
+
+            for idx in range(len(readers)):
+                advance(idx)
+            while heap:
+                timestamp, idx, _, raw, metadata = heapq.heappop(heap)
+                writer._write_block_epb(
+                    raw,
+                    ifid=map_interface(idx),
+                    timestamp=timestamp - metadata.tsoffset,
+                    caplen=len(raw),
+                    orglen=metadata.wirelen,
+                    comments=metadata.comments,
+                    flags=metadata.direction,
+                    tsresol=metadata.tsresol,
+                )
+                advance(idx)
+        finally:
+            writer.close()
+    finally:
+        for reader in readers:
+            reader.close()
 
 
 @conf.commands.register

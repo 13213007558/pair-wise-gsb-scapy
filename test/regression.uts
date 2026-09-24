@@ -3199,6 +3199,141 @@ for cls in [Loopback, LoopbackOpenBSD]:
 
 ############
 ############
++ pcapng merge
+~ pcap
+
+= Build pcapng merge samples
+
+def _ngblock(endian, btype, body):
+    body += b"\x00" * (-len(body) % 4)
+    return struct.pack(endian + "II", btype, len(body) + 12) + body + struct.pack(endian + "I", len(body) + 12)
+
+def _ngshb(endian):
+    magic = b"\x1a\x2b\x3c\x4d" if endian == ">" else b"\x4d\x3c\x2b\x1a"
+    body = magic + struct.pack(endian + "Hhq", 1, 0, -1)
+    return b"\x0a\x0d\x0d\x0a" + struct.pack(endian + "I", len(body) + 12) + body + struct.pack(endian + "I", len(body) + 12)
+
+def _ngopt(endian, code, value):
+    return struct.pack(endian + "HH", code, len(value)) + value + b"\x00" * (-len(value) % 4)
+
+def _ngidb(endian, name=None, tsresol=None, tsoffset=None, comment=None):
+    opts = b""
+    if comment is not None:
+        opts += _ngopt(endian, 1, comment)
+    if name is not None:
+        opts += _ngopt(endian, 2, name)
+    if tsresol is not None:
+        opts += _ngopt(endian, 9, bytes([tsresol]))
+    if tsoffset is not None:
+        opts += _ngopt(endian, 14, struct.pack(endian + "q", tsoffset))
+    opts += struct.pack(endian + "HH", 0, 0)
+    return _ngblock(endian, 1, struct.pack(endian + "HxxI", 1, 262144) + opts)
+
+def _ngepb(endian, ifid, ticks, data, comment=None):
+    opts = b""
+    if comment is not None:
+        opts += _ngopt(endian, 1, comment)
+    if opts:
+        opts += struct.pack(endian + "HH", 0, 0)
+    body = struct.pack(endian + "5I", ifid, ticks >> 32, ticks & 0xffffffff, len(data), len(data))
+    body += data + b"\x00" * (-len(data) % 4) + opts
+    return _ngblock(endian, 6, body)
+
+def _ngspb(endian, data):
+    return _ngblock(endian, 3, struct.pack(endian + "I", len(data)) + data)
+
+# File A: little-endian, decimal tsresol 10**9, interface "eth0"
+mergefileA = _ngshb("<")
+mergefileA += _ngidb("<", name=b"eth0", tsresol=9, comment=b"iface A")
+mergefileA += _ngepb("<", 0, 1700000000000000001, b"A1" + bytes(58), comment=b"a1")
+mergefileA += _ngepb("<", 0, 1700000000500000000, b"A2" + bytes(58))
+mergefileA += _ngspb("<", b"A3" + bytes(58))
+mergefileA += _ngblock("<", 0xABC, b"mystery")
+
+# File B: big-endian, binary tsresol 2**30 and tsoffset, another "eth0"
+# interface, then a second little-endian section with interface "eth1"
+mergefileB = _ngshb(">")
+mergefileB += _ngidb(">", name=b"eth0", tsresol=0x80 | 30, tsoffset=100)
+mergefileB += _ngepb(">", 0, 1699999900 * 2**30 + 2, b"B1" + bytes(58))
+mergefileB += _ngshb("<")
+mergefileB += _ngidb("<", name=b"eth1")
+mergefileB += _ngepb("<", 0, 1700000000250000, b"B2" + bytes(58))
+
+assert rdpcap(BytesIO(mergefileA))[0].time == EDecimal(1700000000000000001) / 10**9
+
+= Merge pcapng files with mixed endianness, tsresol and tsoffset
+
+from fractions import Fraction
+
+tmpfile = get_temp_file(autoext=".pcapng")
+merge_pcapng(tmpfile, [BytesIO(mergefileB), BytesIO(mergefileA)],
+             spb="keep", unknown_blocks="keep")
+
+merged = rdpcap(tmpfile)
+assert len(merged) == 5
+# A1 (1700000000.000000001) is before B1 (1700000000.0000000018...) :
+# the sub-nanosecond difference would be lost by a float comparison
+assert [bytes(p)[:2] for p in merged] == [b"A1", b"B1", b"B2", b"A2", b"A3"]
+assert list(sorted(p.time for p in merged[:4])) == [p.time for p in merged[:4]]
+assert merged[0].sniffed_on == merged[1].sniffed_on == "eth0"
+assert merged[2].sniffed_on == "eth1"
+assert merged[0].comments == [b"a1"]
+
+# Times and interface attributes are preserved exactly
+reader = RawPcapNgReader(tmpfile)
+merged_times = []
+while True:
+    try:
+        _, metadata = reader._read_packet(size=0xffffffff)
+    except EOFError:
+        break
+    if metadata.tshigh is None:
+        merged_times.append(None)
+    else:
+        merged_times.append(Fraction(
+            (metadata.tshigh << 32) + metadata.tslow, metadata.tsresol
+        ) + metadata.tsoffset)
+
+assert merged_times == [
+    Fraction(1700000000000000001, 10**9),
+    Fraction(1699999900 * 2**30 + 2, 2**30) + 100,
+    Fraction(1700000000250000, 10**6),
+    Fraction(1700000000500000000, 10**9),
+    None,
+]
+nginterfaces = [options for _, _, options in reader.interfaces]
+assert [o["name"] for o in nginterfaces] == [b"eth0", b"eth0", b"eth1"]
+assert [o["tsresol"] for o in nginterfaces] == [10**9, 2**30, 10**6]
+assert [o["tsoffset"] for o in nginterfaces] == [0, 100, 0]
+assert nginterfaces[0]["comment"] == b"iface A"
+
+# The unknown block was copied to the output
+merged_data = open(tmpfile, "rb").read()
+assert struct.pack("<I", 0xABC) in merged_data
+
+= merge_pcapng drop policies and timestamp ties
+
+from unittest import mock
+
+with mock.patch("scapy.utils.warning") as mock_warning:
+    tmpfile = get_temp_file(autoext=".pcapng")
+    merge_pcapng(tmpfile, [BytesIO(mergefileB), BytesIO(mergefileA)])
+    assert len(rdpcap(tmpfile)) == 4
+    messages = [call[0][0] for call in mock_warning.call_args_list]
+    assert any("Simple Packet Block" in msg for msg in messages)
+    assert any("unknown type" in msg for msg in messages)
+
+# Packets with identical timestamps are ordered by input file order,
+# then by their order in the file
+tiefile1 = _ngshb("<") + _ngidb("<") + _ngepb("<", 0, 1000000, b"T1" + bytes(58))
+tiefile2 = _ngshb("<") + _ngidb("<") + _ngepb("<", 0, 1000000, b"T2" + bytes(58)) + _ngepb("<", 0, 1000000, b"T3" + bytes(58))
+tmpfile = get_temp_file(autoext=".pcapng")
+merge_pcapng(tmpfile, [BytesIO(tiefile1), BytesIO(tiefile2)])
+assert [bytes(p)[:2] for p in rdpcap(tmpfile)] == [b"T1", b"T2", b"T3"]
+merge_pcapng(tmpfile, [BytesIO(tiefile2), BytesIO(tiefile1)])
+assert [bytes(p)[:2] for p in rdpcap(tmpfile)] == [b"T2", b"T3", b"T1"]
+############
+############
 + ERF Ethernet format support 
 
 = Variable creations
