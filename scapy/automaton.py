@@ -1075,9 +1075,122 @@ class Automaton(metaclass=Automaton_metaclass):
             _run()
             return None
 
+    @classmethod
+    def replay(cls, packets, *args, **kargs):
+        # type: (Iterable[Tuple[float, Any]], Any, Any) -> ReplayResult
+        """
+        Run the automaton offline, driven by a virtual clock.
+
+        Instead of using real sockets and real time, the automaton is fed
+        with a schedule of ``(virtual_time, packet)`` tuples:
+
+        - incoming packets are delivered at their virtual time,
+        - timers are instantly advanced to their expiration,
+        - everything the automaton sends is captured, nothing is sent
+          to the network.
+
+        The automaton class itself is used unmodified: states, timeouts,
+        immediate transitions and actions follow the exact same semantics
+        as in a real run. As no real time is ever spent waiting, a replay
+        is deterministic: replaying the same schedule twice yields the
+        same trace, and waiting one minute or one day of virtual time
+        takes the same (null) real time.
+
+        Fixed rule: when a timer and an incoming packet are scheduled at
+        the exact same virtual time, the timer expires first.
+
+        Note: only the main socket (recv_conditions) and the timers are
+        driven; ioevents on external file descriptors are not.
+
+        :param packets: schedule of ``(virtual_time, packet)`` tuples
+        :param start: virtual time at which the replay starts (default 0)
+        :param max_transitions: raise ReplayLoopError once this many
+            state transitions happened without the run terminating
+            (default 10000)
+        :param max_idle_transitions: raise ReplayLoopError once this many
+            consecutive state transitions happened without any
+            virtual-time progress (default 1000)
+        :return: a ReplayResult holding the (time, state) trace, the
+            (time, packet) list of captured sends and the final output
+        :raises ReplayExhausted: no packet nor timer is left to advance
+            the virtual time but the automaton is still waiting
+        :raises ReplayLoopError: the automaton keeps switching states
+            without the virtual time progressing
+        """
+        start = kargs.pop("start", 0.0)
+        max_transitions = kargs.pop("max_transitions", 10000)
+        max_idle_transitions = kargs.pop("max_idle_transitions", 1000)
+        clock = [float(start)]
+        events = deque(sorted(
+            (float(t), i, pkt) for i, (t, pkt) in enumerate(packets)
+        ))  # type: Deque[Tuple[float, int, Any]]
+        sent = []       # type: List[Tuple[float, Any]]
+        states = []     # type: List[Tuple[float, str]]
+        sock = _ReplaySocket(clock, events, sent)
+        atmt = cls(*args, sock=sock, **kargs)
+        atmt._get_time = lambda: clock[0]  # type: ignore
+        atmt._select = lambda func, fds, remain: sock.select(  # type: ignore
+            fds, remain)
+        states.append((clock[0], atmt.state.state))
+        output = None
+        idle = 0
+        total = 0
+        recent = deque(maxlen=16)  # type: Deque[str]
+        last_event = (clock[0], len(events))
+        try:
+            while True:
+                try:
+                    output = next(atmt)
+                    break
+                except Automaton.Singlestep as step:
+                    total += 1
+                    now = clock[0]
+                    state_name = cast(str, step.state)
+                    states.append((now, state_name))
+                    recent.append(state_name)
+                    event = (now, len(events))
+                    idle = idle + 1 if event == last_event else 0
+                    last_event = event
+                    if idle >= max_idle_transitions:
+                        raise ReplayLoopError(
+                            "no virtual-time progress over %d transitions "
+                            "at t=%.3f (loop: %s)" % (
+                                idle, now, " -> ".join(recent)))
+                    if total >= max_transitions:
+                        raise ReplayLoopError(
+                            "exceeded %d transitions at t=%.3f "
+                            "(last states: %s)" % (
+                                total, now, " -> ".join(recent)))
+        except ReplayExhausted as exc:
+            raise ReplayExhausted("%s (state [%s], t=%.3f)" % (
+                exc, atmt.state.state, clock[0]))
+        finally:
+            if atmt.isrunning():
+                atmt.forcestop()
+            atmt.destroy()
+        return ReplayResult(states, sent, output)
+
     def master_filter(self, pkt):
         # type: (Packet) -> bool
         return True
+
+    def _get_time(self):
+        # type: () -> float
+        """
+        Current time used to decrement the timers.
+        Isolated so that offline drivers (e.g. Automaton.replay()) can
+        overload it with a virtual clock.
+        """
+        return time.time()
+
+    def _select(self, select_func, fds, remain):
+        # type: (Callable[[List[Any], Optional[float]], List[Any]], List[Any], Optional[float]) -> List[Any]  # noqa: E501
+        """
+        Wait until one of the fds is readable or remain seconds elapse.
+        Isolated so that offline drivers (e.g. Automaton.replay()) can
+        overload it instead of really sleeping.
+        """
+        return select_func(fds, remain)
 
     def my_send(self, pkt, **kwargs):
         # type: (Packet, **Any) -> None
@@ -1414,7 +1527,7 @@ class Automaton(metaclass=Automaton_metaclass):
 
                 # Finally listen and pay attention to timeouts
                 timers.reset()
-                time_previous = time.time()
+                time_previous = self._get_time()
 
                 fds = [self.cmdin]  # type: List[Union[SuperSocket, ObjectPipe[Any]]]
                 select_func = select_objects
@@ -1424,7 +1537,7 @@ class Automaton(metaclass=Automaton_metaclass):
                 for ioev in self.ioevents[self.state.state]:
                     fds.append(self.ioin[ioev.atmt_ioname])
                 while True:
-                    time_current = time.time()
+                    time_current = self._get_time()
                     timers.decrement(time_current - time_previous)
                     time_previous = time_current
                     for timer in timers.expired():
@@ -1432,7 +1545,7 @@ class Automaton(metaclass=Automaton_metaclass):
                     remain = timers.until_next()
 
                     self.debug(5, "Select on %r" % fds)
-                    r = select_func(fds, remain)
+                    r = self._select(select_func, fds, remain)
                     self.debug(5, "Selected %r" % r)
                     for fd in r:
                         self.debug(5, "Looking at %r" % fd)
@@ -1632,3 +1745,115 @@ class Automaton(metaclass=Automaton_metaclass):
         # type: (...) -> Any
         rsm = Message(type=_ATMT_Command.REJECT)
         return self.run(resume=rsm, wait=wait)
+
+
+##################
+# Offline replay #
+##################
+
+
+class ReplayError(Exception):
+    """Base class for Automaton offline replay errors."""
+
+
+class ReplayExhausted(ReplayError):
+    """No packet nor timer left to advance the virtual time, but the
+    automaton is still waiting."""
+
+
+class ReplayLoopError(ReplayError):
+    """The automaton keeps switching states without the virtual time
+    progressing."""
+
+
+class ReplayResult(object):
+    """Result of an Automaton.replay() offline run.
+
+    :param states: (virtual_time, state_name) of each entered state
+    :param sent: (virtual_time, packet) of each captured send
+    :param output: value returned by the final state
+    """
+
+    def __init__(self, states, sent, output):
+        # type: (List[Tuple[float, str]], List[Tuple[float, Any]], Any) -> None  # noqa: E501
+        self.states = states
+        self.sent = sent
+        self.output = output
+
+    @staticmethod
+    def _pkt_key(pkt):
+        # type: (Any) -> Any
+        if isinstance(pkt, Packet):
+            return bytes(pkt)
+        return pkt
+
+    def __eq__(self, other):
+        # type: (Any) -> bool
+        if not isinstance(other, ReplayResult):
+            return False
+        return (
+            self.states == other.states and
+            self.output == other.output and
+            [self._pkt_key(p) for _, p in self.sent] ==
+            [self._pkt_key(p) for _, p in other.sent]
+        )
+
+    def __repr__(self):
+        # type: () -> str
+        return "<ReplayResult states=%r sent=%r output=%r>" % (
+            self.states, self.sent, self.output)
+
+
+class _ReplaySocket(object):
+    """Offline socket used by Automaton.replay().
+
+    Feeds the automaton with packets scheduled in virtual time and
+    captures everything the automaton sends. Nothing reaches any real
+    network.
+    """
+
+    def __init__(self, clock, events, sent):
+        # type: (List[float], Deque[Tuple[float, int, Any]], List[Tuple[float, Any]]) -> None  # noqa: E501
+        self._clock = clock
+        self._events = events
+        self._sent = sent
+        self.closed = False
+
+    def fileno(self):
+        # type: () -> int
+        return -1
+
+    def recv(self, n=65535):
+        # type: (int) -> Any
+        if not self._events:
+            raise EOFError
+        return self._events.popleft()[2]
+
+    def send(self, pkt):
+        # type: (Any) -> int
+        self._sent.append((self._clock[0], pkt))
+        return 1
+
+    def close(self):
+        # type: () -> None
+        self.closed = True
+
+    def select(self, fds, remain):
+        # type: (List[Any], Optional[float]) -> List[Any]
+        """Advance the virtual clock to the next event and return the
+        file descriptors that are ready at that point."""
+        now = self._clock[0]
+        pkt_at = self._events[0][0] if self._events else None
+        timer_at = None if remain is None else now + remain
+        if pkt_at is None and timer_at is None:
+            raise ReplayExhausted(
+                "no packet nor timer left to advance the virtual time "
+                "(automaton is stuck waiting)")
+        if timer_at is not None and (
+                pkt_at is None or timer_at <= pkt_at + 1e-9):
+            # Fixed rule: a timer expiring at the same virtual time as an
+            # incoming packet fires first.
+            self._clock[0] = timer_at
+            return []
+        self._clock[0] = cast(float, pkt_at)
+        return [self]

@@ -374,3 +374,25 @@ Some protocols allow timer configuration. In order to configure timeout values d
 	@ATMT.timeout(WAITING, 10.0)
 	def waiting_timeout(self):
 	    raise self.END()
+
+
+Offline replay
+--------------
+
+An automaton can be run offline, without sockets nor real time, using ``Automaton.replay()``. The driver takes over time and I/O: it is fed with a schedule of ``(virtual_time, packet)`` tuples, advances a virtual clock instantly from one event to the next (timer expirations and scheduled packets), and captures everything the automaton sends instead of sending it to the network. The automaton class is used unmodified: state entry/exit, timeout arming and cancellation, and immediate transitions follow the same semantics as in a real run.
+
+::
+
+    res = MyAutomaton.replay([(1.5, answer_pkt)], timeout=60)
+    res.states  # [(0.0, 'BEGIN'), (0.0, 'WAIT'), (1.5, 'DONE')]
+    res.sent    # [(0.0, <request pkt>)]
+    res.output  # value returned by the final state
+
+As no real time is spent waiting, a replay is deterministic: replaying the same schedule twice yields the same trace, and waiting one minute or one day of virtual time takes the same (null) real time. When a timer and a packet are scheduled at the exact same virtual time, the timer expires first.
+
+Two errors help debugging a replay:
+
+* ``ReplayExhausted`` is raised when no packet nor timer is left to advance the virtual time but the automaton is still waiting.
+* ``ReplayLoopError`` is raised when the automaton keeps switching states without the virtual time progressing (e.g. two states immediately raising each other). The error message shows the states involved in the loop.
+
+Only the main socket (``ATMT.receive_condition``) and the timers are driven; ``ATMT.ioevent`` external file descriptors are not.

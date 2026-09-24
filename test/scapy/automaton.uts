@@ -467,6 +467,133 @@ graph = HelloWorld.build_graph()
 assert graph.startswith("digraph")
 assert '"BEGIN" -> "END"' in graph
 
++ Automaton offline replay
+
+= Offline replay: retransmit and late answer
+~ automaton
+
+class RetransmitDemo(Automaton):
+    def parse_args(self, timeout=1.0, retries=2, **kargs):
+        Automaton.parse_args(self, **kargs)
+        self.timer_by_name("ack_timeout").set(timeout)
+        self.max_retries = retries
+    @ATMT.state(initial=1)
+    def BEGIN(self):
+        self.attempts = 0
+        raise self.WAIT()
+    @ATMT.state()
+    def WAIT(self):
+        # (re)send the request each time the state is entered
+        self.attempts += 1
+        self.send(IP(dst="192.0.2.1")/UDP(sport=1234, dport=53)/Raw(
+            b"ping%d" % self.attempts))
+    @ATMT.receive_condition(WAIT)
+    def got_ack(self, pkt):
+        if UDP in pkt and Raw in pkt and pkt[Raw].load == b"pong":
+            raise self.DONE()
+    @ATMT.timeout(WAIT, 1.0)
+    def ack_timeout(self):
+        if self.attempts > self.max_retries:
+            raise self.GIVEUP()
+        raise self.WAIT()
+    @ATMT.state(final=1)
+    def DONE(self):
+        return "done"
+    @ATMT.state(final=1)
+    def GIVEUP(self):
+        return "giveup"
+
+pong = IP(src="192.0.2.1")/UDP(sport=53, dport=1234)/Raw(b"pong")
+res = RetransmitDemo.replay([(1.5, pong)])
+res.states
+assert res.states == [(0.0, "BEGIN"), (0.0, "WAIT"), (1.0, "WAIT"),
+                      (1.5, "DONE")]
+assert res.output == "done"
+assert [t for t, p in res.sent] == [0.0, 1.0]
+assert [p[Raw].load for t, p in res.sent] == [b"ping1", b"ping2"]
+
+= Offline replay is deterministic
+~ automaton
+
+res1 = RetransmitDemo.replay([(1.5, pong)])
+res2 = RetransmitDemo.replay([(1.5, pong)])
+assert res1 == res2
+
+= Offline replay: retransmit then give up
+~ automaton
+
+res = RetransmitDemo.replay([])
+res.states
+assert res.states == [(0.0, "BEGIN"), (0.0, "WAIT"), (1.0, "WAIT"),
+                      (2.0, "WAIT"), (3.0, "GIVEUP")]
+assert res.output == "giveup"
+assert len(res.sent) == 3
+
+= Offline replay: timer and packet at the same virtual time
+~ automaton
+
+# Fixed rule: the timer expires first, the packet is delivered after
+res = RetransmitDemo.replay([(1.0, pong)])
+res.states
+assert res.states == [(0.0, "BEGIN"), (0.0, "WAIT"), (1.0, "WAIT"),
+                      (1.0, "DONE")]
+assert len(res.sent) == 2
+
+= Offline replay: virtual time does not consume real time
+~ automaton
+
+import time
+t0 = time.time()
+res_min = RetransmitDemo.replay([], timeout=60)
+d_min = time.time() - t0
+t0 = time.time()
+res_day = RetransmitDemo.replay([], timeout=86400)
+d_day = time.time() - t0
+assert d_min < 5 and d_day < 5
+assert res_day.states[-1] == (3 * 86400.0, "GIVEUP")
+assert len(res_min.sent) == len(res_day.sent) == 3
+
+= Offline replay: infinite loop without time progress
+~ automaton
+
+class LoopDemo(Automaton):
+    @ATMT.state(initial=1)
+    def A(self):
+        raise self.B()
+    @ATMT.state()
+    def B(self):
+        raise self.A()
+
+try:
+    LoopDemo.replay([], ll=lambda: None, recvsock=lambda: None)
+except ReplayLoopError as exc:
+    assert "A" in str(exc) and "B" in str(exc)
+    True
+else:
+    False
+
+= Offline replay: no event left to advance virtual time
+~ automaton
+
+class WaitForeverDemo(Automaton):
+    @ATMT.state(initial=1)
+    def WAIT(self):
+        pass
+    @ATMT.receive_condition(WAIT)
+    def got(self, pkt):
+        raise self.END()
+    @ATMT.state(final=1)
+    def END(self):
+        pass
+
+try:
+    WaitForeverDemo.replay([])
+except ReplayExhausted as exc:
+    assert "WAIT" in str(exc)
+    True
+else:
+    False
+
 = TCP_client automaton
 ~ automaton netaccess needs_root
 * This test retries on failure because it may fail quite easily
