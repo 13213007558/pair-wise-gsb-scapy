@@ -1,0 +1,167 @@
+% Prefix-preserving pcap anonymization
+
+~ prefixanon
+
+############
+############
++ Prefix-preserving mapping
+
+= Deterministic mapping for a fixed key
+
+from scapy.modules.prefixanon import PrefixPreservingAnonymizer, anonymize_pcap
+import ipaddress
+
+anon = PrefixPreservingAnonymizer(b"scapy-prefixanon-test-key")
+anon_same = PrefixPreservingAnonymizer(b"scapy-prefixanon-test-key")
+anon_other = PrefixPreservingAnonymizer(b"scapy-prefixanon-other-key")
+
+def common_prefix_len(a, b):
+    x = ipaddress.ip_address(a)
+    y = ipaddress.ip_address(b)
+    return x.max_prefixlen - (int(x) ^ int(y)).bit_length()
+
+anon.map_ipv4("10.0.0.1") == anon_same.map_ipv4("10.0.0.1") and anon.map_ipv4("10.0.0.1") != anon_other.map_ipv4("10.0.0.1") and anon.map_ipv6("2001:db8::1") == anon_same.map_ipv6("2001:db8::1")
+
+= Shared IPv4 prefixes are preserved
+
+v4_pairs = [("10.0.0.1", "10.255.0.1"), ("10.0.1.1", "10.0.255.1"), ("10.0.0.1", "10.0.0.129")]
+[common_prefix_len(a, b) for a, b in v4_pairs] == [8, 16, 24] and all(common_prefix_len(a, b) == common_prefix_len(anon.map_ipv4(a), anon.map_ipv4(b)) for a, b in v4_pairs) and all(anon.map_ipv4(a) != a for a, _ in v4_pairs)
+
+= Shared IPv6 prefixes are preserved
+
+v6_pairs = [("2001:db8:1::1", "2001:db8:8001::1"), ("2001:db8:1:1::1", "2001:db8:1:8001::1"), ("2001:db8:1:1:1::1", "2001:db8:1:1:8001::1")]
+[common_prefix_len(a, b) for a, b in v6_pairs] == [32, 48, 64] and all(common_prefix_len(a, b) == common_prefix_len(anon.map_ipv6(a), anon.map_ipv6(b)) for a, b in v6_pairs)
+
+############
+############
++ Packet transformation
+
+= TCP checksum is recomputed, MAC and payload untouched
+
+pkt = Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")/IP(src="10.0.0.1", dst="10.0.0.2")/TCP(sport=1234, dport=80, flags="PA")/Raw(load=b"hello")
+pkt = Ether(bytes(pkt))
+anon.transform_packet(pkt)
+out = Ether(bytes(pkt))
+ref = IP(src=anon.map_ipv4("10.0.0.1"), dst=anon.map_ipv4("10.0.0.2"))/TCP(sport=1234, dport=80, flags="PA")/Raw(load=b"hello")
+out[IP].src == ref[IP].src and out[TCP].chksum == IP(bytes(ref))[TCP].chksum and out[Ether].src == "aa:bb:cc:dd:ee:ff" and out[Raw].load == b"hello"
+
+= UDP checksum is recomputed
+
+pkt = IP(src="10.0.0.1", dst="10.0.0.2")/UDP(sport=53, dport=1234)/Raw(load=b"dns")
+pkt = IP(bytes(pkt))
+anon.transform_packet(pkt)
+out = IP(bytes(pkt))
+ref = IP(src=anon.map_ipv4("10.0.0.1"), dst=anon.map_ipv4("10.0.0.2"))/UDP(sport=53, dport=1234)/Raw(load=b"dns")
+out[UDP].chksum == IP(bytes(ref))[UDP].chksum
+
+= ICMP error quotes are consistently mapped
+
+inner = IP(src="10.0.0.1", dst="10.0.0.2")/UDP(sport=53, dport=53)/Raw(load=b"d"*20)
+pkt = IP(src="192.168.0.1", dst="192.168.0.2")/ICMP(type=3, code=3)/inner
+pkt = IP(bytes(pkt))
+quoted_udp_cksum = pkt[UDPerror].chksum
+anon.transform_packet(pkt)
+out = IP(bytes(pkt))
+icmp_cksum = out[ICMP].chksum
+del out[ICMP].chksum
+inner_cksum = out[IPerror].chksum
+del out[IPerror].chksum
+out[IP].src == anon.map_ipv4("192.168.0.1") and out[IPerror].src == anon.map_ipv4("10.0.0.1") and IP(bytes(out))[ICMP].chksum == icmp_cksum and IP(bytes(out[IPerror]))[IP].chksum == inner_cksum and out[UDPerror].chksum == quoted_udp_cksum
+
+= ICMPv6 error quotes are consistently mapped
+
+inner6 = IPv6(src="2001:db8::1", dst="2001:db8::2")/TCP(sport=1, dport=2)/Raw(load=b"q"*50)
+pkt = IPv6(src="fd00::1", dst="fd00::2")/ICMPv6DestUnreach(code=1)/inner6
+pkt = IPv6(bytes(pkt))
+anon.transform_packet(pkt)
+out = IPv6(bytes(pkt))
+cksum = out[ICMPv6DestUnreach].cksum
+del out[ICMPv6DestUnreach].cksum
+out[IPerror6].src == anon.map_ipv6("2001:db8::1") and IPv6(bytes(out))[ICMPv6DestUnreach].cksum == cksum
+
+= ARP addresses are mapped, MAC addresses untouched
+
+pkt = Ether(src="aa:bb:cc:dd:ee:ff", dst="ff:ff:ff:ff:ff:ff")/ARP(op=1, hwsrc="aa:bb:cc:dd:ee:ff", psrc="10.0.0.1", hwdst="00:00:00:00:00:00", pdst="10.0.0.2")
+pkt = Ether(bytes(pkt))
+anon.transform_packet(pkt)
+out = Ether(bytes(pkt))
+out[ARP].psrc == anon.map_ipv4("10.0.0.1") and out[ARP].pdst == anon.map_ipv4("10.0.0.2") and out[ARP].hwsrc == "aa:bb:cc:dd:ee:ff" and out[Ether].src == "aa:bb:cc:dd:ee:ff"
+
+= Truncated packets are reported
+
+full = IP(src="10.0.0.1", dst="10.0.0.2")/TCP(sport=1, dport=2)/Raw(load=b"A"*100)
+pkt = IP(bytes(full)[:40])
+cksum = pkt[TCP].chksum
+reporting = PrefixPreservingAnonymizer(b"scapy-prefixanon-test-key")
+reporting.transform_packet(pkt, 3)
+out = IP(bytes(pkt))
+len(reporting.issues) == 1 and reporting.issues[0].reason == "truncated" and reporting.issues[0].packet == 3 and out[TCP].chksum == cksum and out[IP].src == reporting.map_ipv4("10.0.0.1")
+
+= Fragments that cannot be completed are reported
+
+pkt = IP(src="10.0.0.1", dst="10.0.0.2", flags="MF")/TCP(sport=1, dport=2)/Raw(load=b"B"*50)
+pkt = IP(bytes(pkt))
+cksum = pkt[TCP].chksum
+reporting = PrefixPreservingAnonymizer(b"scapy-prefixanon-test-key")
+reporting.transform_packet(pkt)
+out = IP(bytes(pkt))
+len(reporting.issues) == 1 and reporting.issues[0].reason == "fragmented" and out[TCP].chksum == cksum
+
+= Non-first fragments need no transport checksum
+
+pkt = IP(src="10.0.0.1", dst="10.0.0.2", frag=64)/Raw(load=b"C"*50)
+pkt = IP(bytes(pkt))
+reporting = PrefixPreservingAnonymizer(b"scapy-prefixanon-test-key")
+reporting.transform_packet(pkt)
+out = IP(bytes(pkt))
+cksum = out[IP].chksum
+del out[IP].chksum
+reporting.issues == [] and IP(bytes(out))[IP].chksum == cksum
+
+############
+############
++ pcap file conversion
+
+= Converted files re-parse with valid checksums
+
+import os
+import tempfile
+
+fd, infile = tempfile.mkstemp(suffix=".pcap")
+os.close(fd)
+outfile = infile + ".out"
+outfile2 = infile + ".out2"
+
+pkts = [
+    Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")/IP(src="10.0.0.1", dst="10.0.0.2")/TCP(sport=1234, dport=80, flags="PA")/Raw(load=b"hello"),
+    Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")/IP(src="10.0.0.1", dst="10.0.0.3")/UDP(sport=53, dport=1234)/Raw(load=b"dns"),
+    Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")/IP(src="192.168.0.1", dst="192.168.0.2")/ICMP(type=3, code=3)/IP(src="10.0.0.2", dst="10.0.0.1")/UDP(sport=1, dport=2),
+    Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")/IPv6(src="fd00::1", dst="fd00::2")/TCP(sport=1, dport=2)/Raw(load=b"v6"),
+]
+with PcapWriter(infile, linktype=1) as writer:
+    for p in pkts:
+        writer.write(p)
+
+report = anonymize_pcap(infile, outfile, key=b"scapy-prefixanon-test-key")
+out = rdpcap(outfile)
+
+tcp_cksum = out[0][TCP].chksum
+del out[0][TCP].chksum
+udp_cksum = out[1][UDP].chksum
+del out[1][UDP].chksum
+icmp_cksum = out[2][ICMP].chksum
+del out[2][ICMP].chksum
+tcp6_cksum = out[3][TCP].chksum
+del out[3][TCP].chksum
+
+report.packets == 4 and report.issues == [] and len(out) == 4 and IP(bytes(out[0][IP]))[TCP].chksum == tcp_cksum and IP(bytes(out[1][IP]))[UDP].chksum == udp_cksum and IP(bytes(out[2][IP]))[ICMP].chksum == icmp_cksum and IPv6(bytes(out[3][IPv6]))[TCP].chksum == tcp6_cksum and out[2][IPerror].dst == out[0][IP].src and out[0][Ether].src == "aa:bb:cc:dd:ee:ff" and out[0][Raw].load == b"hello"
+
+= Conversion is repeatable and never stores the key
+
+report2 = anonymize_pcap(infile, outfile2, key=b"scapy-prefixanon-test-key")
+data = open(outfile, "rb").read()
+data2 = open(outfile2, "rb").read()
+os.remove(infile)
+os.remove(outfile)
+os.remove(outfile2)
+data == data2 and b"scapy-prefixanon-test-key" not in data
