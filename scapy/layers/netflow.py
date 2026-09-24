@@ -28,6 +28,11 @@ Using the netflowv9_defragment/ipfix_defragment commands:
 
     >>> sniff(session=NetflowSession, prn=[...])
 
+Templates are tracked per exporter session and observation domain by
+``NetflowSession.template_manager`` (an IPFIXTemplateManager), which
+handles Template Withdrawal Messages, template replacement (versioning)
+and buffers the data records that arrive before their template.
+
 .. note:: You will find more examples over
     https://scapy.readthedocs.io/en/latest/layers/netflow.html
 """
@@ -71,14 +76,17 @@ from scapy.packet import Packet, bind_layers, bind_bottom_up
 from scapy.plist import PacketList
 from scapy.sessions import IPSession
 
-from scapy.layers.inet import UDP
-from scapy.layers.inet6 import IP6Field
+from scapy.layers.inet import IP, TCP, UDP
+from scapy.layers.inet6 import IP6Field, IPv6
 
 # Typing imports
 from typing import (
     Any,
     Dict,
+    List,
     Optional,
+    Set,
+    Tuple,
 )
 
 
@@ -1353,45 +1361,87 @@ class _CustomStrFixedLenField(StrFixedLenField):
         return repr(v)
 
 
+#: fieldLength value used by IPFIX for variable-length Information Elements
+#: (RFC 7011 section 7)
+NETFLOW_VARIABLE_FIELD_LENGTH = 0xffff
+
+
+class _IPFixVariableLengthField(Field):
+    """Field for IPFIX variable-length Information Elements (RFC 7011#7).
+
+    The value is prefixed by its length on one byte, or on three bytes
+    starting with 0xff when the length does not fit on one byte.
+    """
+    def getfield(self, pkt, x):
+        if not x:
+            return x, b""
+        if x[0] < 0xff:
+            length = x[0]
+            return x[1 + length:], x[1:1 + length]
+        if len(x) < 3:
+            return b"", x
+        length = struct.unpack("!H", x[1:3])[0]
+        return x[3 + length:], x[3:3 + length]
+
+    def addfield(self, pkt, s, val):
+        val = val or b""
+        if len(val) < 0xff:
+            return s + struct.pack("!B", len(val)) + val
+        return s + b"\xff" + struct.pack("!H", len(val)) + val
+
+
 def _GenNetflowRecordV9(cls, lengths_list):
     """
     Internal function used to generate the Records from
     their template.
     """
     _fields_desc = []
-    for j, k in lengths_list:
+    for entry in lengths_list:
+        j, k = entry[0], entry[1]
+        # enterpriseNumber when the enterprise bit was set; such
+        # enterprise-specific Information Elements are kept raw, as
+        # they do not refer to the IANA field list
+        enterprise = entry[2] if len(entry) > 2 else None
         # For each field, if it's known in our template list,
         # try to make a nice field for it. Otherwise use an integer
         # or a string default.
         _f_type = None
         _f_kwargs = {}
         _f_isint = False
-        if k in NetflowV910TemplateFields:
+        if not enterprise and k in NetflowV910TemplateFields:
             _f = NetflowV910TemplateFields[k]
             _f_type = _f.field
             _f_kwargs = _f.kwargs
             _f_isint = _f.isint
 
-        if _f_type:
+        _f_name = (
+            NetflowV910TemplateFieldTypes.get(k, "unknown_data")
+            if not enterprise else "unknown_data"
+        )
+
+        if j == NETFLOW_VARIABLE_FIELD_LENGTH:
+            # Variable-length Information Element (RFC 7011#7)
+            _fields_desc.append(_IPFixVariableLengthField(_f_name, b""))
+        elif _f_type:
             if issubclass(_f_type, _AdjustableNetflowField):
                 _f_kwargs["length"] = j
             _fields_desc.append(
                 _f_type(
-                    NetflowV910TemplateFieldTypes.get(k, "unknown_data"),
+                    _f_name,
                     0, **_f_kwargs
                 )
             )
         elif _f_isint:
             _fields_desc.append(
                 NBytesField(
-                    NetflowV910TemplateFieldTypes.get(k, "unknown_data"),
+                    _f_name,
                     0, sz=j
                 )
             )
         else:
             _fields_desc.append(
                 _CustomStrFixedLenField(
-                    NetflowV910TemplateFieldTypes.get(k, "unknown_data"),
+                    _f_name,
                     b"", length=j
                 )
             )
@@ -1415,7 +1465,11 @@ def GetNetflowRecordV9(flowset, templateID=None):
     for ntv9 in flowset.templates:
         llist = []
         for tmpl in ntv9.template_fields:
-            llist.append((tmpl.fieldLength, tmpl.fieldType))
+            llist.append((
+                tmpl.fieldLength,
+                tmpl.fieldType,
+                tmpl.enterpriseNumber if tmpl.enterpriseBit else None,
+            ))
         if llist:
             cls = _GenNetflowRecordV9(NetflowRecordV9, llist)
             definitions[ntv9.templateID] = cls
@@ -1476,111 +1530,354 @@ class NetflowDataflowsetV9(Packet):
         return pkt + pay
 
 
-def _netflowv9_defragment_packet(pkt, definitions, definitions_opts, ignored):
-    """Used internally to process a single packet during defragmenting"""
-    # Dataflowset definitions
-    if NetflowFlowsetV9 in pkt:
-        current = pkt
-        while NetflowFlowsetV9 in current:
-            current = current[NetflowFlowsetV9]
-            for ntv9 in current.templates:
-                llist = []
-                for tmpl in ntv9.template_fields:
-                    llist.append((tmpl.fieldLength, tmpl.fieldType))
-                if llist:
-                    tot_len = sum(x[0] for x in llist)
-                    if not tot_len:
-                        continue
-                    cls = _GenNetflowRecordV9(NetflowRecordV9, llist)
-                    definitions[ntv9.templateID] = (tot_len, cls)
-            current = current.payload
-    # Options definitions
-    if NetflowOptionsFlowsetV9 in pkt:
-        current = pkt
-        while NetflowOptionsFlowsetV9 in current:
-            current = current[NetflowOptionsFlowsetV9]
-            # Load scopes
-            llist = []
-            for scope in current.scopes:
-                llist.append((
-                    scope.scopeFieldlength,
-                    scope.scopeFieldType
-                ))
-            scope_tot_len = sum(x[0] for x in llist)
-            scope_cls = _GenNetflowRecordV9(
-                NetflowOptionsRecordScopeV9,
-                llist
-            )
-            # Load options
-            llist = []
-            for opt in current.options:
-                llist.append((
-                    opt.optionFieldlength,
-                    opt.optionFieldType
-                ))
-            option_tot_len = sum(x[0] for x in llist)
-            option_cls = _GenNetflowRecordV9(
-                NetflowOptionsRecordOptionV9,
-                llist
-            )
-            # Storage
-            definitions_opts[current.templateID] = (
-                scope_tot_len, scope_cls,
-                option_tot_len, option_cls
-            )
-            current = current.payload
-    # Dissect flowsets
-    if NetflowDataflowsetV9 in pkt:
-        current = pkt
-        while NetflowDataflowsetV9 in current:
-            datafl = current[NetflowDataflowsetV9]
-            tid = datafl.templateID
-            if tid not in definitions and tid not in definitions_opts:
-                ignored.add(tid)
-                return
-            # All data is stored in one record, awaiting to be split
-            # If fieldValue is available, the record has not been
-            # defragmented: pop it
-            try:
-                data = datafl.records[0].fieldValue
-                datafl.records.pop(0)
-            except (IndexError, AttributeError):
-                return
-            res = []
-            # Flowset record
-            # Now, according to the flow/option data,
-            # let's re-dissect NetflowDataflowsetV9
-            if tid in definitions:
-                tot_len, cls = definitions[tid]
-                while len(data) >= tot_len:
-                    res.append(cls(data[:tot_len]))
-                    data = data[tot_len:]
-                # Inject dissected data
-                datafl.records = res
-                if data:
-                    if len(data) <= 4:
-                        datafl.add_payload(conf.padding_layer(data))
+@dataclasses.dataclass
+class _NetflowRecordDef:
+    """A record class generated from a template, and the version of this
+    template."""
+    cls: Any  # generated by _GenNetflowRecordV9
+    fixed_length: int  # summed length of the fixed-length fields
+    variable_length: bool  # contains variable-length Information Elements
+    version: int  # version of the template it was generated from
+
+
+@dataclasses.dataclass
+class _PendingNetflowRecord:
+    """A data record kept raw because its template is not available."""
+    dataflowset: Packet  # NetflowDataflowsetV9 holding the raw record
+    reason: str  # why the record could not be dissected
+
+
+# Type of the keys indexing the templates:
+# (exporter, observation domain, templateID)
+_TemplateKey = Tuple[Any, int, int]
+# scope and options record definitions of an options template
+_OptionsDef = Tuple[_NetflowRecordDef, _NetflowRecordDef]
+
+
+def _netflowv9_measure_record(cls, data):
+    """Dissect a single record from the beginning of data.
+    Returns the record (without payload) and the remaining data."""
+    record = cls(data)
+    consumed = len(data) - len(bytes(record.payload))
+    return cls(data[:consumed]), data[consumed:]
+
+
+def _netflowv9_split_records(data, rec_def):
+    """Split data into records according to a _NetflowRecordDef.
+    Returns the records and the remaining data."""
+    records = []
+    if rec_def.variable_length:
+        # Records contain variable-length Information Elements: dissect
+        # them one at a time to find their boundaries
+        while data:
+            record, rest = _netflowv9_measure_record(rec_def.cls, data)
+            records.append(record)
+            progressed = len(rest) < len(data)
+            data = rest
+            if not progressed:
+                break
+        return records, data
+    tot_len = rec_def.fixed_length
+    while tot_len and len(data) >= tot_len:
+        records.append(rec_def.cls(data[:tot_len]))
+        data = data[tot_len:]
+    return records, data
+
+
+def _netflow_template_key(pkt, templateID):
+    """Identity of a template: exporter session (transport endpoints),
+    observation domain and template ID (RFC 7011 section 8)."""
+    if NetflowHeaderV10 in pkt:
+        domain = pkt[NetflowHeaderV10].ObservationDomainID
+    elif NetflowHeaderV9 in pkt:
+        domain = pkt[NetflowHeaderV9].SourceID
+    else:
+        domain = 0
+    exporter = None
+    ip = pkt.getlayer(IP) or pkt.getlayer(IPv6)
+    if ip is not None:
+        l4 = pkt.getlayer(UDP) or pkt.getlayer(TCP)
+        exporter = (
+            ip.src,
+            ip.dst,
+            l4.sport if l4 is not None else None,
+            l4.dport if l4 is not None else None,
+        )
+    return (exporter, domain, templateID)
+
+
+class IPFIXTemplateManager:
+    """Tracks the NetflowV9/IPFIX template state of a capture.
+
+    Templates are indexed by exporter session (transport endpoints),
+    observation domain and template ID, so that several exporters (or
+    observation domains) reusing the same template IDs do not interfere
+    (RFC 7011 section 8).
+
+    - Template Withdrawal Messages remove the matching template: data
+      records received afterwards can no longer be dissected with it.
+    - A template redefined with the same ID replaces the previous one
+      and gets a new version, which only applies to subsequently
+      dissected records. Dissected records carry the `template_version`
+      they were dissected with.
+    - Data records received before their template are buffered (bounded
+      by `max_pending`) with the reason why they could not be dissected,
+      and are dissected in place when the matching template arrives.
+      They are never dissected using a template from another exporter
+      session or observation domain.
+    """
+
+    def __init__(self, max_pending: int = 256) -> None:
+        # (exporter, domain, templateID) -> _NetflowRecordDef
+        self.definitions: Dict[_TemplateKey, _NetflowRecordDef] = {}
+        # (exporter, domain, templateID) -> (scope, options) definitions
+        self.definitions_opts: Dict[_TemplateKey, _OptionsDef] = {}
+        # (exporter, domain, templateID) -> buffered data records
+        self.pending: Dict[_TemplateKey, List[_PendingNetflowRecord]] = {}
+        self.ignored: Set[_TemplateKey] = set()
+        self._withdrawn: Set[_TemplateKey] = set()
+        self._versions: Dict[_TemplateKey, int] = {}
+        self.max_pending = max_pending
+
+    def _bump_version(self, key):
+        version = self._versions.get(key, 0) + 1
+        self._versions[key] = version
+        return version
+
+    def register_template(self, key, fields):
+        """Register a template for a key. `fields` is a list of
+        (fieldLength, fieldType, enterpriseNumber) tuples. Re-registering
+        a key replaces the previous template and bumps its version."""
+        fixed_length = sum(
+            x[0] for x in fields
+            if x[0] != NETFLOW_VARIABLE_FIELD_LENGTH
+        )
+        variable_length = any(
+            x[0] == NETFLOW_VARIABLE_FIELD_LENGTH for x in fields
+        )
+        if not fixed_length and not variable_length:
+            # A template without any parsable field cannot split records
+            return
+        version = self._bump_version(key)
+        self.definitions[key] = _NetflowRecordDef(
+            _GenNetflowRecordV9(NetflowRecordV9, fields),
+            fixed_length,
+            variable_length,
+            version,
+        )
+        self._withdrawn.discard(key)
+        self.reprocess_pending(key)
+
+    def register_options_template(self, key, scope_fields, option_fields):
+        """Register an options template for a key. See register_template."""
+        version = self._bump_version(key)
+        self.definitions_opts[key] = (
+            _NetflowRecordDef(
+                _GenNetflowRecordV9(
+                    NetflowOptionsRecordScopeV9, scope_fields
+                ),
+                sum(
+                    x[0] for x in scope_fields
+                    if x[0] != NETFLOW_VARIABLE_FIELD_LENGTH
+                ),
+                any(
+                    x[0] == NETFLOW_VARIABLE_FIELD_LENGTH
+                    for x in scope_fields
+                ),
+                version,
+            ),
+            _NetflowRecordDef(
+                _GenNetflowRecordV9(
+                    NetflowOptionsRecordOptionV9, option_fields
+                ),
+                sum(
+                    x[0] for x in option_fields
+                    if x[0] != NETFLOW_VARIABLE_FIELD_LENGTH
+                ),
+                any(
+                    x[0] == NETFLOW_VARIABLE_FIELD_LENGTH
+                    for x in option_fields
+                ),
+                version,
+            ),
+        )
+        self._withdrawn.discard(key)
+        self.reprocess_pending(key)
+
+    def withdraw_template(self, key):
+        """Withdraw a template (RFC 7011 section 8). Data records
+        received afterwards can no longer be dissected using it."""
+        self.definitions.pop(key, None)
+        self.definitions_opts.pop(key, None)
+        self._withdrawn.add(key)
+
+    def process_packet(self, pkt):
+        """Update the template state from a NetflowV9/IPFIX packet, then
+        dissect its data records with the current templates."""
+        # Template definitions
+        if NetflowFlowsetV9 in pkt:
+            current = pkt
+            while NetflowFlowsetV9 in current:
+                current = current[NetflowFlowsetV9]
+                for ntv9 in current.templates:
+                    key = _netflow_template_key(pkt, ntv9.templateID)
+                    if not ntv9.template_fields:
+                        # Template Withdrawal Message: Field Count of 0
+                        # (RFC 7011 section 8)
+                        self.withdraw_template(key)
                     else:
-                        datafl.do_dissect_payload(data)
-            # Options
-            elif tid in definitions_opts:
-                (scope_len, scope_cls,
-                    option_len, option_cls) = definitions_opts[tid]
-                # Dissect scopes
-                if scope_len:
-                    res.append(scope_cls(data[:scope_len]))
-                if option_len:
-                    res.append(
-                        option_cls(data[scope_len:scope_len + option_len])
+                        self.register_template(
+                            key,
+                            [
+                                (
+                                    tmpl.fieldLength,
+                                    tmpl.fieldType,
+                                    tmpl.enterpriseNumber
+                                    if tmpl.enterpriseBit else None,
+                                )
+                                for tmpl in ntv9.template_fields
+                            ],
+                        )
+                current = current.payload
+        # Options template definitions
+        if NetflowOptionsFlowsetV9 in pkt:
+            current = pkt
+            while NetflowOptionsFlowsetV9 in current:
+                current = current[NetflowOptionsFlowsetV9]
+                key = _netflow_template_key(pkt, current.templateID)
+                if not current.scopes and not current.options:
+                    # Options Template Withdrawal Message
+                    self.withdraw_template(key)
+                else:
+                    self.register_options_template(
+                        key,
+                        [
+                            (
+                                scope.scopeFieldlength,
+                                scope.scopeFieldType,
+                                None,
+                            )
+                            for scope in current.scopes
+                        ],
+                        [
+                            (
+                                opt.optionFieldlength,
+                                opt.optionFieldType,
+                                opt.enterpriseNumber
+                                if opt.enterpriseBit else None,
+                            )
+                            for opt in current.options
+                        ],
                     )
-                if len(data) > scope_len + option_len:
-                    res.append(
-                        conf.padding_layer(data[scope_len + option_len:])
-                    )
-                # Inject dissected data
-                datafl.records = res
-                datafl.name = "Netflow DataFlowSet V9/10 - OPTIONS"
-            current = datafl.payload
+                current = current.payload
+        # Data records
+        if NetflowDataflowsetV9 in pkt:
+            current = pkt
+            while NetflowDataflowsetV9 in current:
+                datafl = current[NetflowDataflowsetV9]
+                key = _netflow_template_key(pkt, datafl.templateID)
+                if not self.decode_dataflowset(key, datafl):
+                    if key in self._withdrawn:
+                        reason = (
+                            "template %d was withdrawn"
+                            % datafl.templateID
+                        )
+                    elif (key in self.definitions or
+                          key in self.definitions_opts):
+                        reason = (
+                            "data does not match template %d"
+                            % datafl.templateID
+                        )
+                    else:
+                        reason = (
+                            "no template %d for this exporter session and "
+                            "observation domain" % datafl.templateID
+                        )
+                    self.ignored.add(key)
+                    self._store_pending(key, datafl, reason)
+                current = datafl.payload
+
+    def decode_dataflowset(self, key, datafl):
+        """Dissect the records of a NetflowDataflowsetV9 in place using
+        the template registered for the key. Returns False when no
+        template is available for it."""
+        definition = None
+        options_definition = None
+        if key in self.definitions:
+            definition = self.definitions[key]
+        elif key in self.definitions_opts:
+            options_definition = self.definitions_opts[key]
+        if definition is None and options_definition is None:
+            return False
+        # All data is stored in one record, awaiting to be split.
+        # If fieldValue is available, the record has not been
+        # defragmented yet
+        try:
+            data = datafl.records[0].fieldValue
+        except (IndexError, AttributeError):
+            return True
+        if definition is not None:
+            records, rest = _netflowv9_split_records(data, definition)
+            if not records and data:
+                # The template does not match this data: keep the raw
+                # record untouched
+                return False
+            datafl.records.pop(0)
+            for record in records:
+                record.template_version = definition.version
+            # Inject dissected data
+            datafl.records = records
+            if rest:
+                data = rest
+                if len(data) <= 4:
+                    datafl.add_payload(conf.padding_layer(data))
+                else:
+                    datafl.do_dissect_payload(data)
+            return True
+        # Options
+        scope_def, option_def = options_definition
+        records = []
+        datafl.records.pop(0)
+        for rec_def in (scope_def, option_def):
+            if rec_def.fixed_length or rec_def.variable_length:
+                record, data = _netflowv9_measure_record(rec_def.cls, data)
+                record.template_version = rec_def.version
+                records.append(record)
+        if data:
+            records.append(conf.padding_layer(data))
+        # Inject dissected data
+        datafl.records = records
+        datafl.name = "Netflow DataFlowSet V9/10 - OPTIONS"
+        return True
+
+    def _store_pending(self, key, datafl, reason):
+        """Buffer a data record that cannot be dissected yet. The raw
+        record stays in its packet, tagged with the reason."""
+        try:
+            record = datafl.records[0]
+            record.fieldValue
+        except (IndexError, AttributeError):
+            return
+        record.undecoded_reason = reason
+        entries = self.pending.setdefault(key, [])
+        if any(entry.dataflowset is datafl for entry in entries):
+            return
+        if len(entries) >= self.max_pending:
+            # The buffer is bounded: drop the oldest entry. Its raw data
+            # remains available in its packet
+            entries.pop(0)
+        entries.append(_PendingNetflowRecord(datafl, reason))
+
+    def reprocess_pending(self, key=None):
+        """Try to dissect the buffered data records again, e.g. after
+        their template arrived. When `key` is set, only reprocess the
+        records waiting for this template."""
+        keys = [key] if key is not None else list(self.pending)
+        for k in keys:
+            entries = self.pending.pop(k, [])
+            for entry in entries:
+                if not self.decode_dataflowset(k, entry.dataflowset):
+                    self.pending.setdefault(k, []).append(entry)
 
 
 def netflowv9_defragment(plist, verb=1):
@@ -1595,17 +1892,11 @@ def netflowv9_defragment(plist, verb=1):
         plist = [plist]
     # We need the whole packet to be dissected to access field def in
     # NetflowFlowsetV9 or NetflowOptionsFlowsetV9/10
-    definitions = {}
-    definitions_opts = {}
-    ignored = set()
-    # Iterate through initial list
+    manager = IPFIXTemplateManager()
     for pkt in plist:
-        _netflowv9_defragment_packet(pkt,
-                                     definitions,
-                                     definitions_opts,
-                                     ignored)
-    if conf.verb >= 1 and ignored:
-        warning("Ignored templateIDs (missing): %s" % list(ignored))
+        manager.process_packet(pkt)
+    if conf.verb >= 1 and manager.ignored:
+        warning("Ignored templateIDs (missing): %s" % list(manager.ignored))
     return plist
 
 
@@ -1617,21 +1908,22 @@ def ipfix_defragment(*args, **kwargs):
 class NetflowSession(IPSession):
     """Session used to defragment NetflowV9/10 packets on the flow.
     See help(scapy.layers.netflow) for more infos.
+
+    The template state is tracked per exporter session and observation
+    domain in the `template_manager` attribute (an
+    IPFIXTemplateManager), which handles Template Withdrawal Messages,
+    template versioning and the buffering of data records that arrive
+    before their template.
     """
     def __init__(self, *args, **kwargs):
-        self.definitions = {}
-        self.definitions_opts = {}
-        self.ignored = set()
+        self.template_manager = IPFIXTemplateManager()
         super(NetflowSession, self).__init__(*args, **kwargs)
 
     def process(self, pkt: Packet) -> Optional[Packet]:
         pkt = super(NetflowSession, self).process(pkt)
         if not pkt:
             return
-        _netflowv9_defragment_packet(pkt,
-                                     self.definitions,
-                                     self.definitions_opts,
-                                     self.ignored)
+        self.template_manager.process_packet(pkt)
         return pkt
 
 

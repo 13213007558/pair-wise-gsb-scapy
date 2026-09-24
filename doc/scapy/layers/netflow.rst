@@ -99,3 +99,16 @@ With the previous example::
 
     pkt = Ether(raw(pkt))  # will loose the defragmentation
     pkt = netflowv9_defragment(pkt)[0]
+
+Both methods track the templates per exporter session (transport
+endpoints) and observation domain, so that exporters reusing the same
+template IDs do not interfere. The state is held by
+:class:`~scapy.layers.netflow.IPFIXTemplateManager`, available as
+``NetflowSession().template_manager``. It handles Template Withdrawal
+Messages, versions the templates when they are redefined (dissected
+records carry the ``template_version`` they were dissected with) and
+buffers, up to ``max_pending`` records per template, the data records
+that arrive before their template. Records that cannot be dissected
+keep their raw data and an ``undecoded_reason``; they are dissected in
+place once their template arrives, or later on demand with
+``template_manager.reprocess_pending()``.
