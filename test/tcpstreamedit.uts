@@ -1,0 +1,139 @@
+% TCP stream edit module tests
+
+~ tcp
+
++ Build and edit a connection
+
+= Module loading
+
+load_module("tcpstreamedit")
+
+= Build a sample connection (retransmission, SACK, sequence wraparound)
+
+MOD = 1 << 32
+C_ISN = 0xFFFFFFF8
+S_ISN = 500
+
+def cseq(off):
+    return (C_ISN + 1 + off) % MOD
+
+def sseq(off):
+    return (S_ISN + 1 + off) % MOD
+
+def C(flags, seq, ack=0, data=b"", options=[]):
+    p = IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=12345, dport=80,
+                                                 flags=flags, seq=seq, ack=ack,
+                                                 options=options)
+    if data:
+        p = p / data
+    return p
+
+def S(flags, seq, ack=0, data=b"", options=[]):
+    p = IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=80, dport=12345,
+                                                 flags=flags, seq=seq, ack=ack,
+                                                 options=options)
+    if data:
+        p = p / data
+    return p
+
+cdata = [b"AAAAAAA", b"BBBBBBBB", b"CCCCCCCCCC"]
+sdata = b"HTTP/1.1 200 OK\r\n\r\n"
+sl = len(sdata)
+repl = b"<REPLACED-CONTENT!!>"
+
+pkts = [
+    C("S", C_ISN),
+    S("SA", S_ISN, ack=cseq(0)),
+    C("A", cseq(0), ack=sseq(0)),
+    C("PA", cseq(0), ack=sseq(0), data=cdata[0]),
+    S("PA", sseq(0), ack=cseq(7), data=sdata),
+    C("A", cseq(7), ack=sseq(sl)),
+    C("PA", cseq(7), ack=sseq(sl), data=cdata[1]),
+    C("PA", cseq(15), ack=sseq(sl), data=cdata[2]),
+    S("A", sseq(sl), ack=cseq(7), options=[("SAck", (cseq(15), cseq(25)))]),
+    C("PA", cseq(7), ack=sseq(sl), data=cdata[1]),
+    S("A", sseq(sl), ack=cseq(25)),
+    C("FA", cseq(25), ack=sseq(sl)),
+    S("FA", sseq(sl), ack=cseq(26)),
+    C("A", cseq(26), ack=sseq(sl + 1)),
+]
+
+def reassemble(packets, src, sport, isn):
+    stream = bytearray()
+    segs = []
+    for p in packets:
+        t = p.getlayer(TCP)
+        if t is None or p[IP].src != src or t.sport != sport:
+            continue
+        pl = bytes(t.payload)
+        if pl:
+            segs.append(((t.seq - isn - 1) % MOD, pl))
+    for off, d in sorted(segs, key=lambda s: s[0]):
+        if off > len(stream):
+            return None
+        ov = len(stream) - off
+        if d[:ov] != bytes(stream[off:]):
+            return None
+        stream += d[ov:]
+    return bytes(stream)
+
+snapshot = [bytes(p) for p in pkts]
+out = tcp_stream_edit(pkts, "10.0.0.1", 12345, "10.0.0.2", 80, 5, 15, repl)
+
+= Edit replaces the reassembled stream interval
+
+assert len(out) == len(pkts)
+assert reassemble(out, "10.0.0.1", 12345, C_ISN) == cdata[0][:5] + repl + cdata[2]
+assert reassemble(out, "10.0.0.2", 80, S_ISN) == sdata
+
+= Retransmissions carry the same replacement
+
+assert bytes(out[6][TCP].payload) == repl
+assert bytes(out[9][TCP].payload) == repl
+assert out[6][TCP].seq == out[9][TCP].seq == cseq(5)
+
+= ACK, SACK and FIN are mapped to the new sequence space
+
+assert out[4][TCP].ack == cseq(5)
+assert out[8][TCP].ack == cseq(5)
+assert ("SAck", (cseq(25), cseq(35))) in out[8][TCP].options
+assert out[10][TCP].ack == cseq(35)
+assert out[11][TCP].seq == cseq(35)
+assert out[12][TCP].ack == cseq(36)
+assert cseq(35) < cseq(0)
+
+= Lengths and checksums are recomputed
+
+for p in out:
+    ip = p[IP]
+    assert ip.len == len(bytes(ip))
+    q = p.copy()
+    del q[IP].chksum
+    assert IP(bytes(q[IP])).chksum == ip.chksum
+    q = p.copy()
+    del q[TCP].chksum
+    assert TCP(bytes(q[TCP])).chksum == p[TCP].chksum
+
+= Input packets are not modified
+
+assert all(bytes(p) == s for p, s in zip(pkts, snapshot))
+
+= Incomplete or conflicting captures are rejected
+
+def expect_error(fn):
+    try:
+        fn()
+    except TCPStreamEditError:
+        return True
+    return False
+
+gaps = pkts[:6] + pkts[7:9] + pkts[10:]
+assert expect_error(lambda: tcp_stream_edit(gaps, "10.0.0.1", 12345,
+                                            "10.0.0.2", 80, 5, 15, repl))
+conflict = pkts[:6] + [C("PA", cseq(7), ack=sseq(sl), data=b"XXXXXXXX")] + pkts[7:]
+assert expect_error(lambda: tcp_stream_edit(conflict, "10.0.0.1", 12345,
+                                            "10.0.0.2", 80, 5, 15, repl))
+assert expect_error(lambda: tcp_stream_edit(pkts[3:], "10.0.0.1", 12345,
+                                            "10.0.0.2", 80, 5, 15, repl))
+assert expect_error(lambda: tcp_stream_edit(pkts, "10.0.0.1", 12345,
+                                            "10.0.0.2", 80, 5, 100, repl))
