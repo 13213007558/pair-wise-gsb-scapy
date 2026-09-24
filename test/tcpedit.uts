@@ -1,0 +1,229 @@
+% TCP stream edition
+
++ Sample connection
+
+= Helpers and sample connection
+~ tcpedit
+
+from scapy.modules.tcpedit import (
+    StreamEdit,
+    TCPStreamEditError,
+    tcp_stream_edit,
+)
+
+CL = ("10.0.0.1", 5000)
+SR = ("10.0.0.2", 80)
+M = 2 ** 32
+
+
+def make_pkt(src, dst, flags, seq, ack, data=b"", sack=None):
+    p = IP(src=src[0], dst=dst[0]) / TCP(
+        sport=src[1], dport=dst[1], flags=flags, seq=seq, ack=ack)
+    if sack:
+        p[TCP].options = [("SAck", sack)]
+    if data:
+        p = p / Raw(load=data)
+    return p
+
+
+def build_connection(C, S):
+    # Client stream: "hello OLD world" sent as [0, 8) + [8, 15), with
+    # the second segment received first (SACK) and a retransmission of
+    # the first one.  Server stream: "200 OK".  Both ends FIN.
+    return [
+        make_pkt(CL, SR, "S", C, 0),
+        make_pkt(SR, CL, "SA", S, (C + 1) % M),
+        make_pkt(CL, SR, "A", (C + 1) % M, S + 1),
+        make_pkt(CL, SR, "PA", (C + 9) % M, S + 1, b"D world"),
+        make_pkt(SR, CL, "A", S + 1, (C + 1) % M,
+                 sack=((C + 9) % M, (C + 16) % M)),
+        make_pkt(CL, SR, "PA", (C + 1) % M, S + 1, b"hello OL"),
+        make_pkt(CL, SR, "PA", (C + 1) % M, S + 1, b"hello OL"),
+        make_pkt(SR, CL, "A", S + 1, (C + 16) % M),
+        make_pkt(SR, CL, "PA", S + 1, (C + 16) % M, b"200 OK"),
+        make_pkt(CL, SR, "A", (C + 16) % M, S + 7),
+        make_pkt(SR, CL, "FA", S + 7, (C + 16) % M),
+        make_pkt(CL, SR, "A", (C + 16) % M, S + 8),
+        make_pkt(CL, SR, "FA", (C + 16) % M, S + 8),
+        make_pkt(SR, CL, "A", S + 8, (C + 17) % M),
+    ]
+
+
+def reassemble(pkts, sender):
+    isn = None
+    stream = bytearray()
+    for p in pkts:
+        t = p[TCP]
+        if (p[IP].src, t.sport) != sender:
+            continue
+        if t.flags.S:
+            isn = t.seq
+        data = bytes(t.payload)
+        if not data:
+            continue
+        off = (t.seq - isn - 1) % M
+        if off + len(data) > len(stream):
+            stream += b"\x00" * (off + len(data) - len(stream))
+        stream[off:off + len(data)] = data
+    return bytes(stream)
+
+
+packets = build_connection(1000, 5000)
+out = tcp_stream_edit(packets, StreamEdit(CL, 6, 9, b"BRAND NEW"))
+
+True
+
++ Sequence and acknowledgment remapping
+
+= Data segments are remapped to the new stream
+~ tcpedit
+
+# "OLD" ([6, 9)) becomes "BRAND NEW": delta is +6.
+# [0, 8) maps to [0, 15), [8, 15) maps to [6, 21).
+o = [p[TCP] for p in out]
+ok = o[5].seq == 1001 and bytes(out[5][TCP].payload) == b"hello BRAND NEW"
+ok = ok and o[3].seq == 1007
+ok = ok and bytes(out[3][TCP].payload) == b"BRAND NEW world"
+ok
+
+= Retransmissions carry the same replacement
+~ tcpedit
+
+o = [p[TCP] for p in out]
+o[6].seq == o[5].seq and bytes(out[6][TCP].payload) == bytes(out[5][TCP].payload)
+
+= ACK, SACK and FIN are translated
+~ tcpedit
+
+o = [p[TCP] for p in out]
+ok = o[4].ack == 1001  # nothing received yet: unchanged
+ok = ok and o[4].options == [("SAck", (1007, 1022))]
+ok = ok and o[7].ack == 1022  # cumulative ACK shifted by delta
+ok = ok and o[9].seq == 1022 and o[9].ack == 5007  # other direction untouched
+ok = ok and o[10].seq == 5007 and o[10].ack == 1022
+ok = ok and o[12].seq == 1022  # FIN occupies a sequence number
+ok = ok and o[13].ack == 1023  # ACK of the FIN
+ok
+
+= Reassembled streams match the edit
+~ tcpedit
+
+ok = reassemble(out, CL) == b"hello BRAND NEW world"
+ok = ok and reassemble(out, SR) == b"200 OK"
+ok
+
+= Lengths and checksums are recomputed
+~ tcpedit
+
+ok = True
+for op in out:
+    raw = bytes(op)
+    q = IP(raw)
+    del q[IP].len, q[IP].chksum, q[TCP].chksum
+    ok = ok and bytes(q) == raw
+
+ok
+
+= Original packets are left unmodified
+~ tcpedit
+
+again = build_connection(1000, 5000)
+[bytes(p) for p in packets] == [bytes(p) for p in again]
+
++ Boundary mapping rules
+
+= ACK pointing inside the replaced interval
+~ tcpedit
+
+# An ACK strictly inside [6, 9) maps to the end of the replacement.
+pkts = [
+    make_pkt(CL, SR, "S", 1000, 0),
+    make_pkt(SR, CL, "SA", 5000, 1001),
+    make_pkt(CL, SR, "A", 1001, 5001),
+    make_pkt(CL, SR, "PA", 1001, 5001, b"hello OL"),
+    make_pkt(SR, CL, "A", 5001, 1009),  # acks offset 8: inside [6, 9)
+    make_pkt(CL, SR, "PA", 1009, 5001, b"D world"),
+    make_pkt(SR, CL, "A", 5001, 1016),
+]
+out2 = tcp_stream_edit(pkts, StreamEdit(CL, 6, 9, b"BRAND NEW"))
+ok = out2[4][TCP].ack == 1016  # end of the replacement (offset 15)
+ok = ok and out2[6][TCP].ack == 1022
+ok = ok and reassemble(out2, CL) == b"hello BRAND NEW world"
+ok
+
++ Sequence number wrap-around
+
+= Edit with ISN close to 2**32
+~ tcpedit
+
+wpackets = build_connection(0xFFFFFFFC, 5000)
+wout = tcp_stream_edit(wpackets, StreamEdit(CL, 6, 9, b"BRAND NEW"))
+wo = [p[TCP] for p in wout]
+ok = wo[5].seq == 0xFFFFFFFD  # C + 1
+ok = ok and wo[3].seq == 3  # C + 7, wrapped
+ok = ok and wo[4].options == [("SAck", (3, 18))]  # C + 7, C + 22
+ok = ok and wo[12].seq == 18  # FIN at C + 22, wrapped
+ok = ok and wo[13].ack == 19  # ACK of the FIN
+ok = ok and reassemble(wout, CL) == b"hello BRAND NEW world"
+ok = ok and reassemble(wout, SR) == b"200 OK"
+ok
+
++ Rejections
+
+= Missing fragments are rejected
+~ tcpedit
+
+pkts = build_connection(1000, 5000)
+del pkts[6], pkts[5]  # drop "hello OL" and its retransmission
+try:
+    tcp_stream_edit(pkts, StreamEdit(CL, 6, 9, b"X"))
+    rejected = False
+except TCPStreamEditError:
+    rejected = True
+
+rejected
+
+= Conflicts in the edited interval are rejected
+~ tcpedit
+
+pkts = build_connection(1000, 5000)
+pkts.insert(6, make_pkt(CL, SR, "PA", 1007, 5001, b"XYZ"))
+try:
+    tcp_stream_edit(pkts, StreamEdit(CL, 6, 9, b"X"))
+    rejected = False
+except TCPStreamEditError:
+    rejected = True
+
+rejected
+
+= Conflicts outside the edited interval are tolerated
+~ tcpedit
+
+pkts = build_connection(1000, 5000)
+pkts.insert(8, make_pkt(CL, SR, "PA", 1013, 5001, b"XXX"))
+tout = tcp_stream_edit(pkts, StreamEdit(CL, 6, 9, b"BRAND NEW"))
+reassemble(tout, CL) == b"hello BRAND NEW world"
+
+= Incomplete captures and invalid edits are rejected
+~ tcpedit
+
+rejected = 0
+try:
+    tcp_stream_edit(build_connection(1000, 5000)[:3],
+                    StreamEdit(CL, 0, 1, b"X"))  # no server SYN
+except TCPStreamEditError:
+    rejected += 1
+
+try:
+    tcp_stream_edit(build_connection(1000, 5000),
+                    StreamEdit(("10.9.9.9", 1), 0, 1, b"X"))  # unknown sender
+except TCPStreamEditError:
+    rejected += 1
+
+try:
+    tcp_stream_edit(build_connection(1000, 5000),
+                    StreamEdit(CL, 10, 100, b"X"))  # beyond end of stream
+except TCPStreamEditError:
+    rejected += 1
+
+rejected == 3
