@@ -542,3 +542,91 @@ dscp_dataset = NetflowDataflowsetV9(
 
 # record is generated with 2 zero bytes of padding
 assert(raw(dscp_dataset) == b'\x01\x11\x00\x08\x2a\x00\x00\x00')
+
+############
+############
++ IPFIX template state management
+~ netflow
+
+= NetflowSession - IPFIX templates per exporter and observation domain
+
+filename = scapy_path("/test/pcaps/ipfix_template_lifecycle.pcap")
+session = NetflowSession()
+pkts = sniff(offline=filename, session=session)
+mgr = session.ipfix_templates
+mgr.flush()
+
+# Two observation domains reuse template ID 256: each data set is
+# dissected with the template of its own domain
+recs = pkts[2][NetflowDataflowsetV9].records
+assert len(recs) == 2
+assert recs[0].IPV4_SRC_ADDR == "192.168.0.1"
+assert recs[0].IPV4_DST_ADDR == "192.168.0.2"
+assert recs[0].template_version == 1
+assert recs[1].IPV4_SRC_ADDR == "192.168.0.3"
+
+rec = pkts[3][NetflowDataflowsetV9].records[0]
+assert rec.IPV4_SRC_ADDR == "10.1.1.1"
+assert rec.PROTOCOL == 6
+# enterprise-specific and variable-length fields
+assert rec.enterprise_9_4444 == b"\x12\x34"
+assert rec.unknown_data == b"hello"
+assert rec.template_version == 1
+
+# The data set received before its template was buffered, then
+# dissected once the template arrived
+rec = pkts[4][NetflowDataflowsetV9].records[0]
+assert rec.IPV4_SRC_ADDR == "10.0.3.1"
+assert rec.IPV4_DST_ADDR == "10.0.3.2"
+assert rec.template_version == 1
+
+# Data received after the Template Withdrawal is not dissected with
+# the former definition: the raw record is kept, with the reason
+rec = pkts[6][NetflowDataflowsetV9].records[0]
+assert rec.fieldValue == b"\xc0\xa8\x00\x05\xc0\xa8\x00\x06"
+withdrawn = [r for r in mgr.unresolved if r.withdrawn]
+assert len(withdrawn) == 1
+assert withdrawn[0].template_id == 256 and withdrawn[0].domain_id == 1
+assert withdrawn[0].data == b"\xc0\xa8\x00\x05\xc0\xa8\x00\x06"
+assert "withdrawn" in withdrawn[0].reason
+
+# The replacement template only affects subsequent records
+rec = pkts[8][NetflowDataflowsetV9].records[0]
+assert rec.template_version == 2
+assert rec.L4_SRC_PORT == 443
+assert mgr.versions[(("10.0.0.1", 2055), 1, 256)] == 2
+
+# Options template
+datafl = pkts[12][NetflowDataflowsetV9]
+assert datafl.template_version == 1
+assert isinstance(datafl.records[0], NetflowOptionsRecordScopeV9)
+assert datafl.records[0].TOS == 0x14
+assert isinstance(datafl.records[1], NetflowOptionsRecordOptionV9)
+assert datafl.records[1].FLOW_ACTIVE_TIMEOUT == 60
+
+# Records without a template are kept raw, with the reason
+missing = [r for r in mgr.unresolved if not r.withdrawn]
+assert len(missing) == 1
+assert missing[0].template_id == 999 and missing[0].domain_id == 2
+assert missing[0].data == b"\xde\xad\xbe\xef"
+assert "no template" in missing[0].reason
+rec = pkts[10][NetflowDataflowsetV9].records[0]
+assert rec.fieldValue == b"\xde\xad\xbe\xef"
+
+# They can be reprocessed once a template is available
+late_template = (
+    Ether() / IP(src="10.0.0.2", dst="10.0.0.254") /
+    UDP(sport=2055, dport=2055) /
+    NetflowHeader(version=10) /
+    NetflowHeaderV10(ObservationDomainID=2) /
+    NetflowFlowsetV9(flowSetID=2, templates=[NetflowTemplateV9(
+        templateID=999,
+        template_fields=[NetflowTemplateFieldV9(fieldType=8, fieldLength=4)],
+    )]))
+session.process(Ether(raw(late_template)))
+assert mgr.retry() == 1
+rec = pkts[10][NetflowDataflowsetV9].records[0]
+assert rec.IPV4_SRC_ADDR == "222.173.190.239"
+assert rec.template_version == 1
+# The record received after the withdrawal is left untouched
+assert len(mgr.unresolved) == 1 and mgr.unresolved[0].withdrawn

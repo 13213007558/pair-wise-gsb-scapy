@@ -99,3 +99,15 @@ With the previous example::
 
     pkt = Ether(raw(pkt))  # will loose the defragmentation
     pkt = netflowv9_defragment(pkt)[0]
+
+When dissecting IPFix (NetflowV10) on the flow, ``NetflowSession``
+tracks the templates per exporter session and observation domain
+through its ``ipfix_templates`` attribute (an
+``IPFIXTemplateManager``), so that captures mixing several exporters
+that reuse the same template IDs are dissected against the right
+template. It handles template replacement and withdrawal, options
+templates, enterprise-specific and variable-length fields, and buffers
+(boundedly) data sets received before their template. Data records
+that cannot be dissected are kept raw, with the reason, in
+``ipfix_templates.unresolved`` and can be reprocessed later with
+``ipfix_templates.retry()``.
