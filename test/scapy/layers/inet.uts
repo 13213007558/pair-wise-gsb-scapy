@@ -134,23 +134,23 @@ assert bytes(buffer) == b""
 from scapy.data import MTU
 
 buffer = StringBuffer()
-buffer.append(b"A", 1)
-buffer.append(b"B", MTU + 2)
+assert buffer.append(b"A", 1)
+assert buffer.append(b"B", MTU + 2)
 assert len(buffer) == MTU + 2
 
 buffer = StringBuffer()
-buffer.append(b"A", 1)
-buffer.append(b"B", MTU + 3)
+assert buffer.append(b"A", 1)
+assert not buffer.append(b"B", MTU + 3)
 assert bytes(buffer) == b"A"
 
 buffer = StringBuffer()
-buffer.append(b"A", 1)
-buffer.append(b"C", -MTU)
+assert buffer.append(b"A", 1)
+assert buffer.append(b"C", -MTU)
 assert bytes(buffer) == b"C" + b"\x00" * MTU + b"A"
 
 buffer = StringBuffer()
-buffer.append(b"A", 1)
-buffer.append(b"C", -MTU - 1)
+assert buffer.append(b"A", 1)
+assert not buffer.append(b"C", -MTU - 1)
 assert bytes(buffer) == b"A"
 
 = StringBuffer max_gap is configurable
@@ -633,6 +633,181 @@ with no_debug_dissector(reverse=True):
 
 split_layers(TCP, CustomPacket, sport=12345)
 
+
++ TCPSession overlap policies
+
+= TCPSession overlap policies: first-seen / last-seen / reject-conflict
+
+class LenPrefixedPacket(Packet):
+    fields_desc = [
+        ByteField("len", 0),
+        StrLenField("a", 0, length_from=lambda pkt: pkt.len - 1),
+    ]
+    @classmethod
+    def tcp_reassemble(cls, data, metadata, session):
+        length = struct.unpack("!B", data[:1])[0]
+        if len(data) < length:
+            return None
+        return LenPrefixedPacket(data)
+
+
+bind_layers(TCP, LenPrefixedPacket, sport=12346)
+
+
+def _overlap_pkts():
+    # The same message is covered by 3 segments. The second segment
+    # overlaps seq [3, 5) of the first one with different bytes.
+    return [
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x08AAA",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=3)/b"CCCC",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=7)/b"DD",
+    ]
+
+
+with no_debug_dissector(reverse=True):
+    # first-seen: the bytes received first are kept
+    sess = TCPSession(overlap_policy="first-seen")
+    pkts = sniff(offline=_overlap_pkts(), session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"AAACCDD"
+    # last-seen (the default): the newest segment overwrites the overlap
+    sess = TCPSession(overlap_policy="last-seen")
+    pkts = sniff(offline=_overlap_pkts(), session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"ACCCCDD"
+    # reject-conflict: the conflict is reported and the direction terminated
+    sess = TCPSession(overlap_policy="reject-conflict")
+    pkts = sniff(offline=_overlap_pkts(), session=sess)
+    assert len(pkts) == 0
+    assert len(sess.conflicts) == 1
+    conflict = sess.conflicts[0]
+    assert (conflict.seq_start, conflict.seq_end) == (3, 5)
+    assert conflict.old_data == b"AA" and conflict.new_data == b"CC"
+    assert "2.2.2.2:12346" in conflict.old
+    assert "2.2.2.2:12346" in conflict.new
+    assert len(sess.terminated) == 1
+
+= TCPSession reject-conflict accepts identical retransmissions
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(overlap_policy="reject-conflict")
+    pkts = sniff(offline=[
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x05abc",
+        # partial overlap with identical bytes
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=2)/b"abc",
+        # full retransmission
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x05abc",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=5)/b"d",
+    ], session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"abcd"
+    assert not sess.conflicts
+    assert not sess.terminated
+
+= TCPSession overlap across the 2**32 sequence wrap
+
+def _wrap_pkts():
+    # The message straddles the 2**32 sequence wrap. The second segment
+    # overlaps seq [0, 2) of the first one with different bytes.
+    return [
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=0xFFFFFFFE)/b"\x05ABC",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=0)/b"XY",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=2)/b"Z",
+    ]
+
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(overlap_policy="first-seen")
+    pkts = sniff(offline=_wrap_pkts(), session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"ABCZ"
+    sess = TCPSession(overlap_policy="last-seen")
+    pkts = sniff(offline=_wrap_pkts(), session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"AXYZ"
+    sess = TCPSession(overlap_policy="reject-conflict")
+    pkts = sniff(offline=_wrap_pkts(), session=sess)
+    assert len(pkts) == 0
+    assert len(sess.conflicts) == 1
+    conflict = sess.conflicts[0]
+    assert (conflict.seq_start, conflict.seq_end) == (0, 2)
+    assert conflict.old_data == b"BC" and conflict.new_data == b"XY"
+
+= TCPSession does not hand zero-filled holes to the dissector
+
+with no_debug_dissector(reverse=True):
+    # The segment covering seq [5, 7) is missing: the stream has a hole
+    # and nothing may be reassembled from zero-filled content.
+    sess = TCPSession()
+    pkts = sniff(offline=[
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x08AAA",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=7)/b"DD",
+    ], session=sess)
+    assert len(pkts) == 0
+    # Once the missing segment arrives (out of order), the hole is
+    # filled and reassembly completes.
+    sess = TCPSession()
+    pkts = sniff(offline=[
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x08AAA",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=7)/b"DD",
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=5)/b"CC",
+    ], session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"AAACCDD"
+
+= TCPSession terminates reassembly when the cache bound is exceeded
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(max_gap=4)
+    pkts = sniff(offline=[
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=1)/b"\x09ab",
+        # seq=20 is further than max_gap away: the reassembly of this
+        # direction is explicitly terminated.
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=20)/b"cd",
+        # This segment would complete the message, but the direction is
+        # terminated: nothing is reassembled anymore.
+        IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=12346, dport=12, seq=3)/b"cdefghi",
+    ], session=sess)
+    assert len(pkts) == 0
+    assert len(sess.terminated) == 1
+
+= TCPSession manages both directions independently
+
+bind_layers(TCP, LenPrefixedPacket, sport=12347)
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession(overlap_policy="reject-conflict")
+    pkts = sniff(offline=[
+        # conflict in the 1.1.1.1 -> 2.2.2.2 direction
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12347, seq=1)/b"\x08AAA",
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12347, seq=3)/b"CCCC",
+        # the other direction is unaffected
+        IP(src="2.2.2.2", dst="1.1.1.1")/TCP(sport=12347, dport=12346, seq=10)/b"\x05ok",
+        IP(src="2.2.2.2", dst="1.1.1.1")/TCP(sport=12347, dport=12346, seq=13)/b"ay",
+    ], session=sess)
+    assert len(pkts) == 1
+    assert pkts[0][LenPrefixedPacket].a == b"okay"
+    assert len(sess.conflicts) == 1
+    assert len(sess.terminated) == 1
+
+split_layers(TCP, LenPrefixedPacket, sport=12347)
+
+= TCPSession restarts reassembly on connection reuse
+
+with no_debug_dissector(reverse=True):
+    sess = TCPSession()
+    pkts = sniff(offline=[
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12, seq=1, flags="S"),
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12, seq=1, flags="PA")/b"\x04one",
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12, seq=4, flags="F"),
+        # the 4-tuple is reused with a new initial sequence number
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12, seq=100, flags="S"),
+        IP(src="1.1.1.1", dst="2.2.2.2")/TCP(sport=12346, dport=12, seq=100, flags="PA")/b"\x04two",
+    ], session=sess)
+    data = [p[LenPrefixedPacket].a for p in pkts if LenPrefixedPacket in p]
+    assert data == [b"one", b"two"]
+
+split_layers(TCP, LenPrefixedPacket, sport=12346)
 
 = Layer binding
 

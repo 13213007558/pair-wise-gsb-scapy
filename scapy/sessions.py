@@ -25,6 +25,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Type,
     cast,
@@ -110,7 +111,8 @@ class StringBuffer(object):
     in the fragment.
 
     If a TCP fragment is missed, this class will fill the missing space with
-    zeros.
+    zeros, but keeps track of the missing ranges so that consumers can
+    avoid treating zero-filled holes as valid data (see `full`).
 
     :param max_gap: the largest missing range that will be zero-filled, in bytes.
         A sequence number far from the data already buffered would otherwise
@@ -121,12 +123,94 @@ class StringBuffer(object):
         self.content = bytearray(b"")
         self.content_len = 0
         self.noff = 0  # negative offset
+        # Missing ranges (holes), as sorted non-overlapping (start, end)
+        # offsets relative to the current buffer.
         self.incomplete = []  # type: List[Tuple[int, int]]
+        # Contributor ranges, as [start, end, info] offsets relative to the
+        # current buffer, describing where each buffered byte came from.
+        self.contributors = []  # type: List[List[Any]]
         self.max_gap = max_gap
 
-    def append(self, data: bytes, seq: Optional[int] = None) -> None:
-        if not data:
+    def _add_hole(self, start: int, end: int) -> None:
+        """Mark the [start, end) range as missing."""
+        if start >= end:
             return
+        holes = []  # type: List[Tuple[int, int]]
+        inserted = False
+        for hstart, hend in self.incomplete:
+            if not inserted and end < hstart:
+                holes.append((start, end))
+                inserted = True
+            if inserted or hend < start:
+                holes.append((hstart, hend))
+            else:
+                # Overlapping or adjacent: merge
+                start = min(start, hstart)
+                end = max(end, hend)
+        if not inserted:
+            holes.append((start, end))
+        self.incomplete = holes
+
+    def _fill_holes(self, start: int, end: int) -> None:
+        """Mark the [start, end) range as received."""
+        holes = []  # type: List[Tuple[int, int]]
+        for hstart, hend in self.incomplete:
+            if hend <= start or end <= hstart:
+                holes.append((hstart, hend))
+                continue
+            if hstart < start:
+                holes.append((hstart, start))
+            if end < hend:
+                holes.append((end, hend))
+        self.incomplete = holes
+
+    def covered(self, offset: int, length: int) -> List[Tuple[int, int]]:
+        """Return the sorted (start, end) offsets of the buffered (non-hole)
+        ranges that overlap [offset, offset + length).
+        """
+        end = offset + length
+        ranges = []  # type: List[Tuple[int, int]]
+        start = 0
+        for hstart, hend in self.incomplete:
+            if start < hstart:
+                ranges.append((start, hstart))
+            start = max(start, hend)
+        if start < self.content_len:
+            ranges.append((start, self.content_len))
+        return [
+            (max(start, offset), min(stop, end))
+            for start, stop in ranges
+            if max(start, offset) < min(stop, end)
+        ]
+
+    def note_contributor(self, offset: int, length: int, info: Any) -> None:
+        """Record that the [offset, offset + length) range was written by
+        `info`, replacing any previous contributor on this range.
+        """
+        end = offset + length
+        contributors = []  # type: List[List[Any]]
+        for cstart, cend, cinfo in self.contributors:
+            if cend <= offset or end <= cstart:
+                contributors.append([cstart, cend, cinfo])
+                continue
+            if cstart < offset:
+                contributors.append([cstart, offset, cinfo])
+            if end < cend:
+                contributors.append([end, cend, cinfo])
+        contributors.append([offset, end, info])
+        contributors.sort(key=lambda x: x[0])
+        self.contributors = contributors
+
+    def contributor_at(self, offset: int) -> Optional[Any]:
+        """Return the contributor info covering `offset`, if any."""
+        for cstart, cend, cinfo in self.contributors:
+            if cstart <= offset < cend:
+                return cinfo
+        return None
+
+    def append(self, data: bytes, seq: Optional[int] = None) -> bool:
+        if not data:
+            return True
         data_len = len(data)
         if seq is None:
             seq = self.content_len
@@ -138,10 +222,21 @@ class StringBuffer(object):
                 log_runtime.warning(
                     "Dropped data further than allowed per 'max_gap'."
                 )
-                return
-            self.content = bytearray(b"\x00" * (-seq)) + self.content
-            self.content_len += (-seq)
+                return False
+            shift = -seq
+            self.content = bytearray(b"\x00" * shift) + self.content
+            self.content_len += shift
             self.noff += seq
+            self.incomplete = [
+                (start + shift, end + shift)
+                for start, end in self.incomplete
+            ]
+            self.contributors = [
+                [start + shift, end + shift, info]
+                for start, end, info in self.contributors
+            ]
+            # The prepended zeroes not covered by the new data are missing.
+            self._add_hole(data_len, shift)
             seq = 0
         if seq + data_len > self.content_len:
             # Data is located after the end of the current buffer
@@ -149,27 +244,35 @@ class StringBuffer(object):
                 log_runtime.warning(
                     "Dropped data further than allowed per 'max_gap'."
                 )
-                return
-            self.content += b"\x00" * (seq - self.content_len + data_len)
+                return False
             # As data was missing, mark it.
-            # self.incomplete.append((self.content_len, seq))
+            self._add_hole(self.content_len, seq)
+            self.content += b"\x00" * (seq - self.content_len + data_len)
             self.content_len = seq + data_len
             assert len(self.content) == self.content_len
-        # XXX removes empty space marker.
-        # for ifrag in self.incomplete:
-        #     if [???]:
-        #         self.incomplete.remove([???])
+        self._fill_holes(seq, seq + data_len)
         memoryview(self.content)[seq:seq + data_len] = data
+        return True
 
     def shiftleft(self, i: int) -> None:
         self.content = self.content[i:]
         self.content_len -= i
+        self.incomplete = [
+            (max(start - i, 0), end - i)
+            for start, end in self.incomplete
+            if end > i
+        ]
+        self.contributors = [
+            [max(start - i, 0), end - i, info]
+            for start, end, info in self.contributors
+            if end > i
+        ]
 
     def full(self):
         # type: () -> bool
         # Should only be true when all missing data was filled up,
         # (or there never was missing data)
-        return bool(self)
+        return bool(self.content_len) and not self.incomplete
 
     def clear(self):
         # type: () -> None
@@ -207,6 +310,45 @@ def streamcls(cls: Type[Packet]) -> Callable[
         return lambda data, *_: data and cls(data)
 
 
+def _seq_diff(a, b):
+    # type: (int, int) -> int
+    """Signed difference a - b in TCP sequence number space (RFC 793),
+    handling the 2**32 wrap-around.
+    """
+    return ((a - b + 2**31) % 2**32) - 2**31
+
+
+class TCPOverlapConflict(object):
+    """Report of an overlap between two TCP segments of the same stream
+    whose bytes differ.
+
+    :param flow: description of the stream direction
+    :param old: description of the packet that provided the buffered bytes
+    :param new: description of the packet that provided the conflicting bytes
+    :param seq_start: TCP sequence number of the first conflicting byte
+    :param seq_end: TCP sequence number past the last conflicting byte
+    :param old_data: the conflicting bytes that were buffered
+    :param new_data: the conflicting bytes from the new packet
+    """
+
+    def __init__(self, flow, old, new, seq_start, seq_end, old_data, new_data):
+        # type: (str, Optional[str], str, int, int, bytes, bytes) -> None
+        self.flow = flow
+        self.old = old
+        self.new = new
+        self.seq_start = seq_start
+        self.seq_end = seq_end
+        self.old_data = old_data
+        self.new_data = new_data
+
+    def __repr__(self):
+        # type: () -> str
+        return (
+            "<TCPOverlapConflict %s seq=[%#x, %#x) old=%r new=%r>"
+            % (self.flow, self.seq_start, self.seq_end, self.old, self.new)
+        )
+
+
 class TCPSession(IPSession):
     """A Session that reconstructs TCP streams.
 
@@ -239,12 +381,47 @@ class TCPSession(IPSession):
     :param app: Whether the socket is on application layer = has no TCP
                 layer. This is identical to StreamSocket so only use this if your
                 underlying source of data isn't a socket.socket.
+    :param overlap_policy: how to handle TCP segments whose sequence ranges
+        overlap. One of:
+
+        - "first-seen": keep the bytes that were received first and drop the
+          overlapping part of later segments.
+        - "last-seen" (default): the most recently received segment
+          overwrites the overlapping bytes.
+        - "reject-conflict": overlapping bytes that differ are reported as a
+          TCPOverlapConflict (stored in `conflicts` and logged) and the
+          reassembly of the affected direction is terminated. Overlaps with
+          identical bytes (e.g. retransmissions) are silently accepted.
+
+        Note that holes (missing segments) are never zero-filled into the
+        stream: reassembly waits until every hole is filled.
+    :param max_gap: the largest missing sequence range, in bytes, that the
+        reassembly cache will buffer across. If a segment exceeds this bound,
+        the reassembly of the affected direction is explicitly terminated
+        (the direction is added to `terminated`).
+
+    Reassembly is tracked independently for each direction of each
+    connection. A SYN without ACK is treated as a new connection reusing the
+    4-tuple, and restarts the reassembly state of that direction.
     """
 
-    def __init__(self, app=False, *args, **kwargs):
-        # type: (bool, *Any, **Any) -> None
+    OVERLAP_POLICIES = ("first-seen", "last-seen", "reject-conflict")
+
+    def __init__(self, app=False, overlap_policy="last-seen", max_gap=MTU,
+                 *args, **kwargs):
+        # type: (bool, str, int, *Any, **Any) -> None
         super(TCPSession, self).__init__(*args, **kwargs)
+        if overlap_policy not in self.OVERLAP_POLICIES:
+            raise ValueError(
+                "overlap_policy must be one of %r" % (self.OVERLAP_POLICIES,)
+            )
         self.app = app
+        self.overlap_policy = overlap_policy
+        self.max_gap = max_gap
+        # TCPOverlapConflict entries reported in "reject-conflict" mode
+        self.conflicts = []  # type: List[TCPOverlapConflict]
+        # Uni-directional idents whose reassembly was explicitly terminated
+        self.terminated = set()  # type: Set[bytes]
         if app:
             self.data = StringBuffer()
             self.metadata = {}  # type: Dict[str, Any]
@@ -253,7 +430,7 @@ class TCPSession(IPSession):
             # The StringBuffer() is used to build a global
             # string from fragments and their seq nulber
             self.tcp_frags = defaultdict(
-                lambda: (StringBuffer(), {})
+                lambda: (StringBuffer(max_gap=self.max_gap), {})
             )  # type: DefaultDict[bytes, Tuple[StringBuffer, Dict[str, Any]]]
             self.tcp_sessions = defaultdict(
                 dict
@@ -289,6 +466,98 @@ class TCPSession(IPSession):
             del pad.underlayer.payload
             return cast(bytes, pad.load)
         return None
+
+    @staticmethod
+    def _desc(pkt: Packet) -> str:
+        """Short description of the source of a TCP packet."""
+        underlayer = pkt["TCP"].underlayer
+        src = underlayer.src if underlayer is not None else "?"
+        dst = underlayer.dst if underlayer is not None else "?"
+        return "%s:%s > %s:%s" % (src, pkt["TCP"].sport, dst, pkt["TCP"].dport)
+
+    def _terminate(self, ident: bytes, pkt: Packet) -> None:
+        """Explicitly terminate the reassembly of a stream direction."""
+        self.tcp_frags.pop(ident, None)
+        self.terminated.add(ident)
+        log_runtime.warning(
+            "TCP reassembly of %s terminated", self._desc(pkt)
+        )
+
+    def _report_conflict(self,
+                         pkt: Packet,
+                         data: StringBuffer,
+                         metadata: Dict[str, Any],
+                         ostart: int,
+                         oend: int,
+                         new_data: bytes) -> None:
+        """Report a content conflict on the [ostart, oend) buffer range."""
+        relative_seq = metadata.get("relative_seq", 0)
+        seq_start = (relative_seq + ostart + 1 + data.noff) & 0xFFFFFFFF
+        seq_end = (relative_seq + oend + 1 + data.noff) & 0xFFFFFFFF
+        conflict = TCPOverlapConflict(
+            flow=self._desc(pkt),
+            old=data.contributor_at(ostart),
+            new=self._desc(pkt),
+            seq_start=seq_start,
+            seq_end=seq_end,
+            old_data=bytes(data.content[ostart:oend]),
+            new_data=new_data,
+        )
+        self.conflicts.append(conflict)
+        log_runtime.warning("TCP overlap conflict: %r", conflict)
+
+    def _overlap_filter(
+        self,
+        ident: bytes,
+        pkt: Packet,
+        data: StringBuffer,
+        metadata: Dict[str, Any],
+        new_data: bytes,
+        seq: int,
+    ) -> Optional[List[Tuple[int, bytes]]]:
+        """Apply the overlap policy to new_data (starting at relative
+        sequence `seq`). Returns the (seq, data) pieces to append, or
+        None if the reassembly of this direction was terminated.
+        """
+        if self.overlap_policy == "last-seen":
+            return [(seq, new_data)]
+        offset = seq - 1 - data.noff
+        covered = data.covered(offset, len(new_data))
+        if self.overlap_policy == "first-seen":
+            # Drop the parts of new_data that are already buffered.
+            pieces = []  # type: List[Tuple[int, bytes]]
+            pos = 0
+            for cstart, cend in covered:
+                if pos < cstart - offset:
+                    pieces.append((seq + pos, new_data[pos:cstart - offset]))
+                pos = max(pos, cend - offset)
+            if pos < len(new_data):
+                pieces.append((seq + pos, new_data[pos:]))
+            return pieces
+        # reject-conflict: only report overlaps whose bytes differ.
+        conflicts = []  # type: List[Tuple[int, int]]
+        for cstart, cend in covered:
+            old = bytes(data.content[cstart:cend])
+            new = new_data[cstart - offset:cend - offset]
+            run_start = None  # type: Optional[int]
+            for i in range(len(old)):
+                if old[i] != new[i]:
+                    if run_start is None:
+                        run_start = i
+                elif run_start is not None:
+                    conflicts.append((cstart + run_start, cstart + i))
+                    run_start = None
+            if run_start is not None:
+                conflicts.append((cstart + run_start, cend))
+        if conflicts:
+            for ostart, oend in conflicts:
+                self._report_conflict(
+                    pkt, data, metadata, ostart, oend,
+                    new_data[ostart - offset:oend - offset],
+                )
+            self._terminate(ident, pkt)
+            return None
+        return [(seq, new_data)]
 
     def process(self,
                 pkt: Packet,
@@ -347,15 +616,25 @@ class TCPSession(IPSession):
         new_data = pay.original
         # Match packets by a unique TCP identifier
         ident = self._get_ident(pkt)
+        if pkt[TCP].flags.S and not pkt[TCP].flags.A and not pay:
+            # A new connection is reusing this 4-tuple: restart the
+            # reassembly state of this direction.
+            self.tcp_frags.pop(ident, None)
+            self.terminated.discard(ident)
+            self.tcp_sessions.pop(self._get_ident(pkt, True), None)
+        if ident in self.terminated:
+            # The reassembly of this direction was explicitly terminated
+            # (overlap conflict or cache bound exceeded).
+            return None
         data, metadata = self.tcp_frags[ident]
         tcp_session = self.tcp_sessions[self._get_ident(pkt, True)]
         # Handle TCP sequence numbers
         seq = pkt[TCP].seq
         if "seq" not in metadata:
             metadata["seq"] = seq
-        if "next_seq" in metadata and seq < metadata["next_seq"]:
+        if "next_seq" in metadata and _seq_diff(seq, metadata["next_seq"]) < 0:
             # Retransmitted data (that we already returned)
-            new_data = new_data[metadata["next_seq"] - seq:]
+            new_data = new_data[_seq_diff(metadata["next_seq"], seq):]
             if not new_data:
                 return None
             seq = metadata["next_seq"]
@@ -370,11 +649,25 @@ class TCPSession(IPSession):
             # Get a relative sequence number for a storage purpose
             relative_seq = metadata.get("relative_seq", None)
             if relative_seq is None:
-                relative_seq = metadata["relative_seq"] = seq - 1
-            seq = seq - relative_seq
+                relative_seq = metadata["relative_seq"] = (seq - 1) & 0xFFFFFFFF
+            seq = _seq_diff(seq, relative_seq)
             # Add the data to the buffer
             noff = data.noff
-            data.append(new_data, seq)
+            pieces = self._overlap_filter(
+                ident, pkt, data, metadata, new_data, seq
+            )
+            if pieces is None:
+                # The reassembly of this direction was terminated.
+                return None
+            for pseq, pdata in pieces:
+                if not data.append(pdata, pseq):
+                    # The cache bound (max_gap) was exceeded: explicitly
+                    # terminate the reassembly of this direction.
+                    self._terminate(ident, pkt)
+                    return None
+                data.note_contributor(
+                    pseq - 1 - data.noff, len(pdata), self._desc(pkt)
+                )
             if data.noff != noff:
                 # The negative offset has changed => data was prepended.
                 # this means that our estimate min length may be wrong.
@@ -391,8 +684,9 @@ class TCPSession(IPSession):
         # allow the parser to inspect TCP PSH flag
         if pkt[TCP].flags.P:
             metadata["tcp_psh"] = True
-        # XXX TODO: check that no empty space is missing in the buffer.
-        # XXX Currently, if a TCP fragment was missing, we won't notice it.
+        # Note: data.full() is only true when no hole (missing fragment)
+        # remains in the buffer, so zero-filled holes are never passed
+        # to the dissector as if they were valid stream content.
         if data.full():
             min_len = metadata.get("tcp_min_len")
             if min_len is None or len(data) >= min_len:
@@ -416,7 +710,9 @@ class TCPSession(IPSession):
             while padding:
                 # There is remaining data for the next payload.
                 full_length = data.content_len - len(padding)
-                metadata["relative_seq"] = relative_seq + full_length
+                metadata["relative_seq"] = (
+                    relative_seq + full_length
+                ) & 0xFFFFFFFF
                 data.shiftleft(full_length)
                 # There might be a sub-payload hidden in the padding
                 sub_packet = tcp_reassemble(
@@ -434,7 +730,7 @@ class TCPSession(IPSession):
                 data.clear()
                 del self.tcp_frags[ident]
             # Minimum next seq
-            metadata["next_seq"] = pkt[TCP].seq + len(new_data)
+            metadata["next_seq"] = (pkt[TCP].seq + len(new_data)) & 0xFFFFFFFF
             # Skip full-padding
             if isinstance(packet, conf.padding_layer):
                 return None
