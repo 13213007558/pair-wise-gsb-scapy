@@ -9,6 +9,7 @@ General utility functions.
 
 
 from decimal import Decimal
+from fractions import Fraction
 from io import StringIO
 from itertools import zip_longest
 from uuid import UUID
@@ -20,6 +21,7 @@ import decimal
 import difflib
 import enum
 import gzip
+import heapq
 import inspect
 import locale
 import math
