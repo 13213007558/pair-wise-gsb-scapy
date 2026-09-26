@@ -1,0 +1,123 @@
+% Pure-Python packet filter expressions (scapy.modules.packetfilter)
+
+# More information at http://www.secdev.org/projects/UTScapy/
+
+############
+############
++ Compile filter expressions
+
+= Imports
+~ packetfilter
+
+from scapy.modules.packetfilter import compile_filter, PacketFilter, PacketFilterError
+
+= Sample packets
+~ packetfilter
+
+p4 = IP(src="1.2.3.4", dst="5.6.7.8")/TCP(sport=1234, dport=80)
+p6 = IPv6(raw(IPv6(src="2001:db8::1", dst="2001:db8::2")/IPv6ExtHdrRouting()/UDP(sport=53, dport=5353)))
+vlan2 = Ether(raw(Ether(src="00:11:22:33:44:55", dst="66:77:88:99:aa:bb")/Dot1Q(vlan=1)/Dot1Q(vlan=2)/IP(src="10.0.0.1", dst="10.0.0.2")/TCP(sport=4040, dport=443)))
+frag_first = IP(src="1.2.3.4", dst="5.6.7.8", flags="MF", frag=0)/TCP(sport=1234, dport=80)
+frag_nonfirst = IP(raw(IP(src="1.2.3.4", dst="5.6.7.8", frag=100, proto=6)/Raw(b"\x00\x50\x00\x50aaaa")))
+frag6_nonfirst = IPv6(raw(IPv6(src="2001:db8::1", dst="2001:db8::2")/IPv6ExtHdrFragment(offset=100, nh=6, id=1)/Raw(b"\x00\x50\x00\x50aaaa")))
+
+True
+
+= Compile once, match many packets
+~ packetfilter
+
+filt = compile_filter("tcp and dst port 80")
+isinstance(filt, PacketFilter) and [filt.match(p) for p in [p4, frag_first, p6, vlan2]] == [True, True, False, False]
+
+= Operators and parentheses
+~ packetfilter
+
+filt = compile_filter("not udp and (tcp or ip6)")
+filt.match(p4) and not filt.match(p6) and filt.match(frag6_nonfirst)
+
+= Implicit and between primitives
+~ packetfilter
+
+compile_filter("tcp dst port 80").match(p4)
+
+= host, net, port and portrange primitives
+~ packetfilter
+
+compile_filter("host 1.2.3.4").match(p4) and \
+compile_filter("src host 1.2.3.4").match(p4) and \
+not compile_filter("src host 5.6.7.8").match(p4) and \
+compile_filter("dst net 5.6.7.0/24").match(p4) and \
+not compile_filter("net 5.6.8.0/24").match(p4) and \
+compile_filter("src port 1234").match(p4) and \
+compile_filter("portrange 70-90").match(p4) and \
+not compile_filter("portrange 81-90").match(p4)
+
+= Protocol qualifiers
+~ packetfilter
+
+compile_filter("ip and tcp").match(p4) and \
+not compile_filter("ip6").match(p4) and \
+compile_filter("ip6 and udp and dst port 5353").match(p6) and \
+compile_filter("ip6 net 2001:db8::/32").match(p6) and \
+not compile_filter("tcp port 5353").match(p6)
+
+= Transport layer behind double VLAN
+~ packetfilter
+
+compile_filter("ip and tcp and dst port 443").match(vlan2) and \
+compile_filter("host 10.0.0.1").match(vlan2) and \
+not compile_filter("dst port 80").match(vlan2)
+
+= Transport layer behind IPv6 extension headers
+~ packetfilter
+
+compile_filter("udp and src port 53").match(p6) and \
+compile_filter("ip6 host 2001:db8::2").match(p6)
+
+= Fragments
+~ packetfilter
+
+# First fragments carry the transport header, non-first ones do not:
+# ports must never be guessed from the payload of a non-first fragment.
+compile_filter("dst port 80").match(frag_first) and \
+compile_filter("tcp").match(frag_nonfirst) and \
+not compile_filter("dst port 80").match(frag_nonfirst) and \
+compile_filter("ip6 and tcp").match(frag6_nonfirst) and \
+not compile_filter("port 80").match(frag6_nonfirst)
+
+= Malformed packets never match
+~ packetfilter
+
+class BrokenPacket:
+    def getlayer(self, *args, **kwargs):
+        raise RuntimeError("corrupted packet")
+
+compile_filter("tcp or port 80").match(BrokenPacket()) == False
+
+= Invalid expressions are rejected
+~ packetfilter
+
+bad_expressions = [
+    "icmp",
+    "tcp and",
+    "(tcp",
+    "tcp)",
+    "",
+    "host",
+    "host example.com",
+    "net 10",
+    "port http",
+    "port 70000",
+    "portrange 90-10",
+    "portrange 80",
+    "ip6 host 1.2.3.4",
+    "dst",
+]
+def is_rejected(expr):
+    try:
+        compile_filter(expr)
+    except PacketFilterError:
+        return True
+    return False
+
+all(is_rejected(expr) for expr in bad_expressions)
