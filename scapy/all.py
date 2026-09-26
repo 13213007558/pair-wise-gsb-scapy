@@ -15,6 +15,7 @@ from scapy.error import *
 from scapy.themes import *
 from scapy.arch import *
 from scapy.interfaces import *
+from scapy.packet_filter import *
 
 from scapy.plist import *
 from scapy.fields import *
