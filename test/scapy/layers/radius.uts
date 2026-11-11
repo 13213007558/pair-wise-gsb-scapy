@@ -172,6 +172,321 @@ s = b'\x0b\xae\x00[\xc7\xae\xfc6\xa1=\xb5\x99&^\xdf=\xe9\x00\xa6\xe8\x12\rHello,
 access_challenge = Radius(s)
 access_challenge.compute_authenticator(access_request.authenticator, b"radiuskey") == access_challenge.authenticator
 
+= RADIUS - Message-Authenticator - independent HMAC-MD5 oracle
+# Independent oracles computed with the standard library over the raw wire
+# bytes. They never call the functions under test
+# (RadiusAttr_Message_Authenticator.compute_message_authenticator /
+# Radius.compute_authenticator).
+import hashlib
+import hmac
+import struct
+
+radius_secret = b"radius-shared-secret"
+radius_request_auth = bytes(range(16))
+radius_other_auth = b"\xff" * 16
+
+
+def radius_mauth_oracle(wire, request_auth, secret):
+    # RFC 2869 sect 3.3: HMAC-MD5 over code/id/len + Request Authenticator +
+    # attributes, with the first Message-Authenticator value zeroed.
+    offset = 20
+    first_ma_offset = None
+    while offset < len(wire):
+        attr_type, attr_len = wire[offset], wire[offset + 1]
+        if attr_type == 80 and first_ma_offset is None:
+            first_ma_offset = offset + 2
+        offset += attr_len
+    zeroed = (
+        wire[:first_ma_offset]
+        + b"\x00" * 16
+        + wire[first_ma_offset + 16:]
+    )
+    return hmac.new(
+        secret,
+        zeroed[:4] + request_auth + zeroed[20:],
+        hashlib.md5,
+    ).digest()
+
+
+def radius_response_auth_oracle(wire, request_auth, secret):
+    # RFC 2865 sect 3: MD5(code/id/len + Request Authenticator +
+    # attributes + secret)
+    return hashlib.md5(
+        wire[:4] + request_auth + wire[20:] + secret
+    ).digest()
+
+
+radius_request = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_NAS_IP_Address(value="192.0.2.10"),
+    ],
+)
+radius_wire = bytes(radius_request)
+radius_expected_mauth = radius_mauth_oracle(
+    radius_wire, radius_request_auth, radius_secret
+)
+radius_mauth_attr = radius_request[RadiusAttr_Message_Authenticator]
+radius_got_mauth = radius_mauth_attr.compute_message_authenticator(
+    radius_request, radius_request_auth, radius_secret
+)
+assert radius_got_mauth == radius_expected_mauth
+# Signing only changes the Message-Authenticator value: the packet carrying
+# the computed HMAC still verifies against the raw-byte oracle.
+radius_mauth_attr.value = radius_got_mauth
+radius_signed_wire = bytes(radius_request)
+assert radius_mauth_oracle(
+    radius_signed_wire, radius_request_auth, radius_secret
+) == radius_expected_mauth
+assert len(Radius(radius_signed_wire).attributes) == 3
+
+= RADIUS - Message-Authenticator - binds the attribute order
+radius_request_a = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_NAS_IP_Address(value="192.0.2.10"),
+    ],
+)
+radius_request_b = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_NAS_IP_Address(value="192.0.2.10"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_User_Name(value=b"alice"),
+    ],
+)
+radius_mauth_a = radius_mauth_oracle(
+    bytes(radius_request_a), radius_request_auth, radius_secret
+)
+radius_mauth_b = radius_mauth_oracle(
+    bytes(radius_request_b), radius_request_auth, radius_secret
+)
+assert radius_mauth_a != radius_mauth_b
+assert radius_request_b[
+    RadiusAttr_Message_Authenticator
+].compute_message_authenticator(
+    radius_request_b, radius_request_auth, radius_secret
+) == radius_mauth_b
+
+= RADIUS - Message-Authenticator - binds the whole attribute sequence
+radius_mauth_base = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+    ],
+)
+radius_mauth_changed_value = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alicE"),
+        RadiusAttr_Message_Authenticator(),
+    ],
+)
+radius_mauth_extra_attr = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_NAS_Port(value=4444),
+    ],
+)
+radius_mauth_reference = radius_mauth_oracle(
+    bytes(radius_mauth_base), radius_request_auth, radius_secret
+)
+assert radius_mauth_oracle(
+    bytes(radius_mauth_changed_value), radius_request_auth, radius_secret
+) != radius_mauth_reference
+assert radius_mauth_oracle(
+    bytes(radius_mauth_extra_attr), radius_request_auth, radius_secret
+) != radius_mauth_reference
+
+= RADIUS - Message-Authenticator - duplicate attributes
+radius_dup_request = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_Message_Authenticator(value=b"\x11" * 16),
+    ],
+)
+radius_dup_wire = bytes(radius_dup_request)
+radius_dup_decoded = Radius(radius_dup_wire)
+assert len(radius_dup_decoded.attributes) == 3
+assert sum(
+    1 for attr in radius_dup_decoded.attributes if attr.type == 80
+) == 2
+radius_dup_expected = radius_mauth_oracle(
+    radius_dup_wire, radius_request_auth, radius_secret
+)
+# The packet API only zeroes the first Message-Authenticator; the duplicate
+# stays part of the signed attribute sequence.
+radius_dup_first_mauth = radius_dup_request.attributes[1]
+radius_dup_got = radius_dup_first_mauth.compute_message_authenticator(
+    radius_dup_request, radius_request_auth, radius_secret
+)
+assert radius_dup_got == radius_dup_expected
+assert radius_dup_request.attributes[1].value == b"\x00" * 16
+assert radius_dup_request.attributes[2].value == b"\x11" * 16
+# Tampering with the duplicate value changes the independently computed HMAC.
+radius_dup_tampered = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_Message_Authenticator(),
+        RadiusAttr_Message_Authenticator(value=b"\x22" * 16),
+    ],
+)
+assert radius_mauth_oracle(
+    bytes(radius_dup_tampered), radius_request_auth, radius_secret
+) != radius_dup_expected
+
+= RADIUS - Message-Authenticator - binds the request authenticator and secret
+radius_mini_request = Radius(
+    code=1,
+    id=7,
+    authenticator=radius_request_auth,
+    attributes=[RadiusAttr_Message_Authenticator()],
+)
+radius_mini_wire = bytes(radius_mini_request)
+radius_mini_mauth = radius_mauth_oracle(
+    radius_mini_wire, radius_request_auth, radius_secret
+)
+assert radius_mauth_oracle(
+    radius_mini_wire, radius_other_auth, radius_secret
+) != radius_mini_mauth
+assert radius_mauth_oracle(
+    radius_mini_wire, radius_request_auth, b"other-secret"
+) != radius_mini_mauth
+assert radius_mini_request[
+    RadiusAttr_Message_Authenticator
+].compute_message_authenticator(
+    radius_mini_request, radius_request_auth, radius_secret
+) == radius_mini_mauth
+
+= RADIUS - Response Authenticator - independent MD5 oracle
+radius_response = Radius(
+    code=2,
+    id=7,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_State(value=b"\x22" * 16),
+    ],
+)
+radius_response_wire = bytes(radius_response)
+radius_expected_response_auth = radius_response_auth_oracle(
+    radius_response_wire, radius_request_auth, radius_secret
+)
+assert radius_response.compute_authenticator(
+    radius_request_auth, radius_secret
+) == radius_expected_response_auth
+# The response signature covers the full attribute sequence.
+radius_tampered_response = Radius(
+    code=2,
+    id=7,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_State(value=b"\x23" * 16),
+    ],
+)
+assert radius_response_auth_oracle(
+    bytes(radius_tampered_response), radius_request_auth, radius_secret
+) != radius_expected_response_auth
+# A validly built response embeds exactly the independently derived value.
+radius_response.authenticator = radius_response.compute_authenticator(
+    radius_request_auth, radius_secret
+)
+radius_response_signed_wire = bytes(radius_response)
+assert radius_response_signed_wire[4:20] == radius_expected_response_auth
+assert radius_response_auth_oracle(
+    radius_response_signed_wire, radius_request_auth, radius_secret
+) == radius_expected_response_auth
+
+= RADIUS - Response Authenticator - binds the matched request
+# The same response bytes signed against a different Request Authenticator
+# must fail verification against the original request.
+radius_other_response_auth = radius_response_auth_oracle(
+    radius_response_wire, radius_other_auth, radius_secret
+)
+assert radius_other_response_auth != radius_expected_response_auth
+assert radius_response.compute_authenticator(
+    radius_other_auth, radius_secret
+) == radius_other_response_auth
+# The wrong-request signature does not verify against the real request.
+radius_wrong_response = Radius(
+    code=2,
+    id=7,
+    authenticator=radius_other_response_auth,
+    attributes=[
+        RadiusAttr_User_Name(value=b"alice"),
+        RadiusAttr_State(value=b"\x22" * 16),
+    ],
+)
+assert radius_response_auth_oracle(
+    bytes(radius_wrong_response), radius_request_auth, radius_secret
+) != radius_wrong_response.authenticator
+
+= RADIUS - malformed packets stay constructible
+# Security checks belong to the verification entry point: the build API must
+# emit the user's explicit length and signature bytes instead of silently
+# repairing them.
+radius_bad_length = Radius(
+    code=1,
+    id=9,
+    len=4,
+    authenticator=radius_request_auth,
+    attributes=[RadiusAttr_User_Name(value=b"bob")],
+)
+radius_bad_length_wire = bytes(radius_bad_length)
+assert struct.unpack("!H", radius_bad_length_wire[2:4])[0] == 4
+assert len(radius_bad_length_wire) != 4
+
+radius_bad_attr_wire = bytes(
+    RadiusAttribute(type=1, len=2, value=b"bob")
+)
+assert radius_bad_attr_wire == b"\x01\x02bob"
+
+radius_bad_mauth_wire = bytes(
+    RadiusAttr_Message_Authenticator(len=10)
+)
+assert radius_bad_mauth_wire[1] == 10
+assert len(radius_bad_mauth_wire) == 18
+
+radius_preset_mauth = Radius(
+    code=1,
+    id=2,
+    authenticator=radius_request_auth,
+    attributes=[
+        RadiusAttr_Message_Authenticator(value=b"\x42" * 16),
+    ],
+)
+radius_preset_wire = bytes(radius_preset_mauth)
+assert radius_preset_wire[22:38] == b"\x42" * 16
+# The forged value does not validate against the independent HMAC oracle.
+assert radius_mauth_oracle(
+    radius_preset_wire, radius_request_auth, radius_secret
+) != b"\x42" * 16
+
 = RADIUS - Layers (1)
 radius_attr = RadiusAttr_EAP_Message(value = EAP())
 assert RadiusAttr_EAP_Message in radius_attr
