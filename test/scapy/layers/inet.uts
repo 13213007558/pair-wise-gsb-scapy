@@ -126,7 +126,7 @@ assert len(buffer) == 11
 assert buffer
 
 buffer = StringBuffer()
-buffer.append(b"")
+assert not buffer.append(b"")
 assert not buffer
 assert bytes(buffer) == b""
 
@@ -140,7 +140,7 @@ assert len(buffer) == MTU + 2
 
 buffer = StringBuffer()
 buffer.append(b"A", 1)
-buffer.append(b"B", MTU + 3)
+assert not buffer.append(b"B", MTU + 3)
 assert bytes(buffer) == b"A"
 
 buffer = StringBuffer()
@@ -150,7 +150,7 @@ assert bytes(buffer) == b"C" + b"\x00" * MTU + b"A"
 
 buffer = StringBuffer()
 buffer.append(b"A", 1)
-buffer.append(b"C", -MTU - 1)
+assert not buffer.append(b"C", -MTU - 1)
 assert bytes(buffer) == b"A"
 
 = StringBuffer max_gap is configurable
@@ -670,6 +670,167 @@ with no_debug_dissector(reverse=True):
     assert pkts[0][CustomPacket].a == b"abcde", "retransmitted failure"
 
 split_layers(TCP, CustomPacket, sport=12345)
+
+
+= TCPSession: ambiguity mode reports overlapping segments
+
+class AmbigPacket(Packet):
+    fields_desc = [
+        ByteField("len", 0),
+        StrLenField("a", 0, length_from=lambda pkt: pkt.len - 1),
+    ]
+    @classmethod
+    def tcp_reassemble(cls, data, metadata, session):
+        length = struct.unpack("!B", data[:1])[0]
+        if len(data) < length:
+            return None
+        return AmbigPacket(data)
+
+
+class AmbigPartialPacket(Packet):
+    @classmethod
+    def tcp_reassemble(cls, data, metadata, session):
+        if len(data) < 8:
+            return None
+        pkt = Raw(data[:4])
+        if len(data) > 4:
+            pkt = pkt / Padding(data[4:])
+        return pkt
+
+
+def _ambig_pkt(seq, data, sport=12345):
+    return IP(dst="1.1.1.1", src="2.2.2.2")/TCP(sport=sport, dport=12, seq=seq, flags="PA")/data
+
+
+bind_layers(TCP, AmbigPacket, sport=12345)
+bind_layers(TCP, AmbigPartialPacket, sport=54321)
+
+* identical retransmission
+sess = TCPSession(ambiguity=True)
+pkts = sniff(offline=[
+    _ambig_pkt(1, b"\x05a"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(4, b"c"),
+    _ambig_pkt(5, b"d"),
+], session=sess)
+assert pkts[0][AmbigPacket].a == b"abcd"
+assert len(sess.tcp_ambiguities) == 1
+amb = sess.tcp_ambiguities[0]
+assert amb.kind == "retransmit"
+assert (amb.seq, amb.end) == (3, 4)
+assert amb.buffered == b"b" and amb.incoming == b"b"
+
+* conflicting overlap
+sess = TCPSession(ambiguity=True)
+sniff(offline=[
+    _ambig_pkt(1, b"\x05a"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(3, b"X"),
+    _ambig_pkt(4, b"c"),
+    _ambig_pkt(5, b"d"),
+], session=sess)
+assert len(sess.tcp_ambiguities) == 1
+amb = sess.tcp_ambiguities[0]
+assert amb.kind == "conflict"
+assert (amb.seq, amb.end) == (3, 4)
+assert amb.buffered == b"b" and amb.incoming == b"X"
+assert (amb.src, amb.sport) == ("2.2.2.2", 12345)
+assert (amb.dst, amb.dport) == ("1.1.1.1", 12)
+assert amb.packet[TCP].seq == 3
+assert len(amb.sources) == 1 and amb.sources[0][TCP].seq == 3
+
+* partial overlap
+sess = TCPSession(ambiguity=True)
+sniff(offline=[
+    _ambig_pkt(1, b"\x08a"),
+    _ambig_pkt(3, b"bcde"),
+    _ambig_pkt(5, b"XY"),
+    _ambig_pkt(7, b"f"),
+    _ambig_pkt(8, b"g"),
+], session=sess)
+assert len(sess.tcp_ambiguities) == 1
+amb = sess.tcp_ambiguities[0]
+assert amb.kind == "conflict"
+assert (amb.seq, amb.end) == (5, 7)
+assert amb.buffered == b"de" and amb.incoming == b"XY"
+
+* out-of-order delivery is not a conflict
+sess = TCPSession(ambiguity=True)
+sniff(offline=[
+    _ambig_pkt(1, b"\x06a"),
+    _ambig_pkt(5, b"d"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(4, b"c"),
+    _ambig_pkt(4, b"Z"),
+    _ambig_pkt(6, b"e"),
+], session=sess)
+assert len(sess.tcp_ambiguities) == 1
+amb = sess.tcp_ambiguities[0]
+assert amb.kind == "conflict"
+assert (amb.seq, amb.end) == (4, 5)
+assert amb.buffered == b"c" and amb.incoming == b"Z"
+
+* sequence number wraparound
+sess = TCPSession(ambiguity=True)
+sniff(offline=[
+    _ambig_pkt(0xFFFFFFFE, b"\x04a"),
+    _ambig_pkt(0xFFFFFFFF, b"b"),
+    _ambig_pkt(0xFFFFFFFF, b"Z"),
+], session=sess)
+assert [amb.kind for amb in sess.tcp_ambiguities] == ["conflict", "conflict"]
+amb = sess.tcp_ambiguities[0]
+assert (amb.seq, amb.end) == (0xFFFFFFFF, 0x100000000)
+assert amb.buffered == b"a" and amb.incoming == b"b"
+amb = sess.tcp_ambiguities[1]
+assert (amb.seq, amb.end) == (0xFFFFFFFF, 0x100000000)
+assert amb.buffered == b"b" and amb.incoming == b"Z"
+
+* already delivered data cannot be verified
+sess = TCPSession(ambiguity=True)
+sniff(offline=[
+    _ambig_pkt(1000, b"AAAABBBB", sport=54321),
+    _ambig_pkt(1000, b"AAAA", sport=54321),
+    _ambig_pkt(1006, b"CCDD", sport=54321),
+], session=sess)
+assert [amb.kind for amb in sess.tcp_ambiguities] == ["delivered", "delivered"]
+amb = sess.tcp_ambiguities[0]
+assert (amb.seq, amb.end) == (1000, 1004)
+assert amb.buffered is None and amb.incoming == b"AAAA"
+assert amb.sources == []
+amb = sess.tcp_ambiguities[1]
+assert (amb.seq, amb.end) == (1006, 1008)
+assert amb.incoming == b"CC"
+
+* same through a pcap file
+tmp_file = get_temp_file()
+wrpcap(tmp_file, [
+    _ambig_pkt(1, b"\x05a"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(3, b"X"),
+    _ambig_pkt(4, b"c"),
+    _ambig_pkt(5, b"d"),
+])
+sess = TCPSession(ambiguity=True)
+sniff(offline=tmp_file, session=sess)
+assert len(sess.tcp_ambiguities) == 1
+amb = sess.tcp_ambiguities[0]
+assert amb.kind == "conflict" and amb.buffered == b"b" and amb.incoming == b"X"
+
+* disabled by default
+sess = TCPSession()
+pkts = sniff(offline=[
+    _ambig_pkt(1, b"\x05a"),
+    _ambig_pkt(3, b"b"),
+    _ambig_pkt(3, b"X"),
+    _ambig_pkt(4, b"c"),
+    _ambig_pkt(5, b"d"),
+], session=sess)
+assert sess.tcp_ambiguities == []
+assert pkts[0][AmbigPacket].a == b"aXcd"
+
+split_layers(TCP, AmbigPacket, sport=12345)
+split_layers(TCP, AmbigPartialPacket, sport=54321)
 
 
 = Layer binding

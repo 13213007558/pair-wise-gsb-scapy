@@ -849,6 +849,33 @@ The ``data`` argument is bytes and the ``metadata`` argument is a dictionary whi
 
 If ``tcp_reassemble`` **returns any padding**, it will be kept for the next payload.
 
+Reporting ambiguous TCP overlaps
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When two TCP segments cover the same sequence numbers, only one of them ends
+up in the reassembled stream. Offline analysis (e.g. an IDS) may want to know
+whether the overlapping bytes were identical (a normal retransmission) or
+conflicting (which endpoints may interpret differently). ``TCPSession`` can
+report those overlaps without changing the reassembly itself::
+
+    >>> session = TCPSession(ambiguity=True)
+    >>> sniff(offline="capture.pcap", session=session)
+    >>> session.tcp_ambiguities
+    [<TCPAmbiguity conflict 10.0.0.1:443 -> 10.0.0.2:39200 seq=[1050,1062)>]
+
+Each :py:class:`~scapy.sessions.TCPAmbiguity` records the direction of the
+incoming segment (``src``, ``dst``, ``sport``, ``dport``), the overlapping
+sequence range (``seq``, ``end``), both byte strings (``incoming`` and
+``buffered``) and the packets they were seen in (``packet`` and ``sources``),
+so that one can reconstruct which two inputs diverged. The ``kind`` attribute
+is one of:
+
+- ``retransmit``: both segments carry the same bytes
+- ``conflict``: the segments carry different bytes
+- ``delivered``: the range overlaps data that was already reassembled and
+  discarded, so the previous bytes can no longer be recovered and the overlap
+  cannot be verified
+
 Filters
 -------
 

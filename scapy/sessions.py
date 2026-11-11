@@ -124,9 +124,15 @@ class StringBuffer(object):
         self.incomplete = []  # type: List[Tuple[int, int]]
         self.max_gap = max_gap
 
-    def append(self, data: bytes, seq: Optional[int] = None) -> None:
+    def append(self, data: bytes, seq: Optional[int] = None) -> bool:
+        """
+        Store data at the position indicated by seq.
+
+        :returns: False if the data was dropped (further than allowed per
+            'max_gap'), True otherwise.
+        """
         if not data:
-            return
+            return False
         data_len = len(data)
         if seq is None:
             seq = self.content_len
@@ -138,7 +144,7 @@ class StringBuffer(object):
                 log_runtime.warning(
                     "Dropped data further than allowed per 'max_gap'."
                 )
-                return
+                return False
             self.content = bytearray(b"\x00" * (-seq)) + self.content
             self.content_len += (-seq)
             self.noff += seq
@@ -149,7 +155,7 @@ class StringBuffer(object):
                 log_runtime.warning(
                     "Dropped data further than allowed per 'max_gap'."
                 )
-                return
+                return False
             self.content += b"\x00" * (seq - self.content_len + data_len)
             # As data was missing, mark it.
             # self.incomplete.append((self.content_len, seq))
@@ -160,6 +166,7 @@ class StringBuffer(object):
         #     if [???]:
         #         self.incomplete.remove([???])
         memoryview(self.content)[seq:seq + data_len] = data
+        return True
 
     def shiftleft(self, i: int) -> None:
         self.content = self.content[i:]
@@ -207,6 +214,72 @@ def streamcls(cls: Type[Packet]) -> Callable[
         return lambda data, *_: data and cls(data)
 
 
+class TCPAmbiguity(object):
+    """A single overlap between TCP segments, recorded by TCPSession when
+    its ``ambiguity`` mode is enabled.
+
+    Two segments covering the same sequence numbers may carry identical
+    bytes (a regular retransmission) or conflicting ones (which endpoints
+    may interpret differently). Each record holds both byte strings and
+    the packets they come from, so that an analyst can reconstruct which
+    two inputs diverged.
+
+    :ivar kind: "retransmit" (identical bytes), "conflict" (different
+        bytes) or "delivered" (the range overlaps data that was already
+        reassembled and discarded: the previous bytes are unrecoverable
+        and the overlap cannot be verified).
+    :ivar src: source address of the incoming packet
+    :ivar dst: destination address of the incoming packet
+    :ivar sport: TCP source port of the incoming packet
+    :ivar dport: TCP destination port of the incoming packet
+    :ivar seq: first sequence number of the overlapping range
+    :ivar end: end of the overlapping range (exclusive). ``seq`` and
+        ``end`` are unwrapped: reduce them mod 2**32 to get wire values.
+    :ivar incoming: bytes of the incoming packet over this range
+    :ivar buffered: bytes previously buffered over this range
+        (None for "delivered" records)
+    :ivar packet: the incoming packet
+    :ivar sources: packets that contributed the buffered bytes over this
+        range (empty for "delivered" records)
+    """
+
+    def __init__(self,
+                 kind,  # type: str
+                 pkt,  # type: Packet
+                 seq,  # type: int
+                 end,  # type: int
+                 incoming,  # type: bytes
+                 buffered,  # type: Optional[bytes]
+                 sources,  # type: List[Packet]
+                 ):
+        # type: (...) -> None
+        tcp = pkt["TCP"]
+        underlayer = tcp.underlayer
+        self.kind = kind
+        self.src = underlayer and underlayer.src or None
+        self.dst = underlayer and underlayer.dst or None
+        self.sport = tcp.sport
+        self.dport = tcp.dport
+        self.seq = seq
+        self.end = end
+        self.incoming = incoming
+        self.buffered = buffered
+        self.packet = pkt
+        self.sources = sources
+
+    def __repr__(self):
+        # type: () -> str
+        return "<TCPAmbiguity %s %s:%s -> %s:%s seq=[%r,%r)>" % (
+            self.kind,
+            self.src,
+            self.sport,
+            self.dst,
+            self.dport,
+            self.seq,
+            self.end,
+        )
+
+
 class TCPSession(IPSession):
     """A Session that reconstructs TCP streams.
 
@@ -239,13 +312,27 @@ class TCPSession(IPSession):
     :param app: Whether the socket is on application layer = has no TCP
                 layer. This is identical to StreamSocket so only use this if your
                 underlying source of data isn't a socket.socket.
+    :param ambiguity: Whether to report overlapping TCP segments (not
+                supported with app=True). When enabled, each overlap is
+                classified and appended to ``self.tcp_ambiguities`` as a
+                TCPAmbiguity: "retransmit" when both segments carry the
+                same bytes, "conflict" when they differ, and "delivered"
+                when the range overlaps data that was already reassembled
+                and can no longer be verified. Reassembly itself is
+                unchanged.
     """
 
-    def __init__(self, app=False, *args, **kwargs):
-        # type: (bool, *Any, **Any) -> None
+    def __init__(self, app=False, ambiguity=False, *args, **kwargs):
+        # type: (bool, bool, *Any, **Any) -> None
         super(TCPSession, self).__init__(*args, **kwargs)
         self.app = app
+        self.ambiguity = ambiguity
+        self.tcp_ambiguities = []  # type: List[TCPAmbiguity]
         if app:
+            if ambiguity:
+                log_runtime.warning(
+                    "TCPSession: 'ambiguity' is not supported with app=True."
+                )
             self.data = StringBuffer()
             self.metadata = {}  # type: Dict[str, Any]
             self.session = {}  # type: Dict[str, Any]
@@ -258,6 +345,11 @@ class TCPSession(IPSession):
             self.tcp_sessions = defaultdict(
                 dict
             )  # type: DefaultDict[bytes, Dict[str, Any]]
+            # Packets that contributed bytes to each buffer, as
+            # (unwrapped seq start, unwrapped seq end, packet)
+            self.tcp_ambig_sources = defaultdict(
+                list
+            )  # type: DefaultDict[bytes, List[Tuple[int, int, Packet]]]
         # Setup stopping dissection condition
         from scapy.layers.inet import TCP
         self.stop_dissection_after = TCP
@@ -289,6 +381,74 @@ class TCPSession(IPSession):
             del pad.underlayer.payload
             return cast(bytes, pad.load)
         return None
+
+    def _tcp_check_ambiguity(self,
+                             ident,  # type: bytes
+                             pkt,  # type: Packet
+                             data,  # type: StringBuffer
+                             relative_seq,  # type: int
+                             seq,  # type: int
+                             new_data,  # type: bytes
+                             ):
+        # type: (...) -> int
+        """ambiguity mode: compare incoming data against the bytes already
+        buffered for this direction, and record any overlap as a
+        TCPAmbiguity ("retransmit" or "conflict").
+
+        :returns: the unwrapped absolute sequence number of new_data.
+        """
+        sources = self.tcp_ambig_sources[ident]
+        # Absolute sequence number of the first buffered byte
+        buf_base = relative_seq + 1 + data.noff
+        # Unwrap seq around the buffer to handle sequence number wraparound
+        start = buf_base + (
+            (seq - buf_base + 0x80000000) % 0x100000000
+        ) - 0x80000000
+        end = start + len(new_data)
+        ov_start = max(start, buf_base)
+        ov_end = min(end, buf_base + data.content_len)
+        if ov_start >= ov_end:
+            return start
+        # Drop the ranges that the buffer has already moved past
+        sources[:] = [source for source in sources if source[1] > buf_base]
+        # Only compare against bytes that were really received: where
+        # fragments are still missing, the buffer is zero-filled and
+        # holds no evidence.
+        holes = [(ov_start, ov_end)]
+        for src_start, src_end, _ in sources:
+            holes = [
+                part
+                for hole_start, hole_end in holes
+                for part in (
+                    (hole_start, min(hole_end, src_start)),
+                    (max(hole_start, src_end), hole_end),
+                )
+                if part[0] < part[1]
+            ]
+        known = []  # type: List[Tuple[int, int]]
+        cursor = ov_start
+        for hole_start, hole_end in sorted(holes):
+            if cursor < hole_start:
+                known.append((cursor, hole_start))
+            cursor = max(cursor, hole_end)
+        if cursor < ov_end:
+            known.append((cursor, ov_end))
+        for rg_start, rg_end in known:
+            buffered = bytes(data.content[rg_start - buf_base:
+                                          rg_end - buf_base])
+            incoming = new_data[rg_start - start:rg_end - start]
+            self.tcp_ambiguities.append(TCPAmbiguity(
+                "conflict" if buffered != incoming else "retransmit",
+                pkt,
+                rg_start,
+                rg_end,
+                incoming,
+                buffered,
+                [src_pkt
+                 for src_start, src_end, src_pkt in sources
+                 if src_start < rg_end and rg_start < src_end],
+            ))
+        return start
 
     def process(self,
                 pkt: Packet,
@@ -355,6 +515,20 @@ class TCPSession(IPSession):
             metadata["seq"] = seq
         if "next_seq" in metadata and seq < metadata["next_seq"]:
             # Retransmitted data (that we already returned)
+            if self.ambiguity:
+                delivered = new_data[:metadata["next_seq"] - seq]
+                if delivered:
+                    # Those bytes were already reassembled and discarded:
+                    # the overlap cannot be verified anymore.
+                    self.tcp_ambiguities.append(TCPAmbiguity(
+                        "delivered",
+                        pkt,
+                        seq,
+                        seq + len(delivered),
+                        delivered,
+                        None,
+                        [],
+                    ))
             new_data = new_data[metadata["next_seq"] - seq:]
             if not new_data:
                 return None
@@ -371,10 +545,19 @@ class TCPSession(IPSession):
             relative_seq = metadata.get("relative_seq", None)
             if relative_seq is None:
                 relative_seq = metadata["relative_seq"] = seq - 1
+            if self.ambiguity:
+                abs_seq = self._tcp_check_ambiguity(
+                    ident, pkt, data, relative_seq, seq, new_data
+                )
             seq = seq - relative_seq
             # Add the data to the buffer
             noff = data.noff
-            data.append(new_data, seq)
+            if data.append(new_data, seq):
+                if self.ambiguity:
+                    # Remember which packet provided those bytes
+                    self.tcp_ambig_sources[ident].append(
+                        (abs_seq, abs_seq + len(new_data), pkt)
+                    )
             if data.noff != noff:
                 # The negative offset has changed => data was prepended.
                 # this means that our estimate min length may be wrong.
@@ -433,6 +616,8 @@ class TCPSession(IPSession):
                 # No padding (data) left. Clear
                 data.clear()
                 del self.tcp_frags[ident]
+                if self.ambiguity:
+                    self.tcp_ambig_sources.pop(ident, None)
             # Minimum next seq
             metadata["next_seq"] = pkt[TCP].seq + len(new_data)
             # Skip full-padding
