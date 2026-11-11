@@ -4430,3 +4430,330 @@ e[IPv6ExtHdrRouting].segleft = 0
 d = sa.decrypt(e)
 d
 
+###############################################################################
++ Anti-replay window
+
+#######################################
+= Anti-replay - disabled by default (historical behavior)
+
+* Fixed keys and a fixed IV keep the offline packet sequence deterministic.
+* The transport mode decrypt() mutates its input, so replays are fed a fresh
+* dissection of the same captured bytes.
+
+CRYPT_KEY = b'sixteenbytes key'
+AUTH_KEY = b'secret key!!'
+FIXED_IV = bytes(range(16))
+
+
+def replay_pkt(pkt):
+    return pkt.__class__(raw(pkt))
+
+
+def replay_base_v4():
+    p = IP(src='1.1.1.1', dst='2.2.2.2')
+    p /= TCP(sport=45012, dport=80)
+    p /= Raw('testdata')
+    return IP(raw(p))
+
+
+def replay_base_v6():
+    p = IPv6(src='11::22', dst='22::11')
+    p /= TCP(sport=45012, dport=80)
+    p /= Raw('testdata')
+    return IPv6(raw(p))
+
+
+sender = SecurityAssociation(ESP, spi=0x222,
+                             crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                             auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+
+assert sa.replay_window is None
+
+e = sender.encrypt(replay_base_v4(), iv=FIXED_IV)
+sa.decrypt(replay_pkt(e))
+* duplicates are accepted and no state is recorded when the window is off
+sa.decrypt(replay_pkt(e))
+
+#######################################
+= Anti-replay - IPSecReplayWindow parameter validation
+
+try:
+    IPSecReplayWindow(-1)
+    assert False
+except ValueError:
+    pass
+
+for bad_value in ('x', 1.5, True):
+    try:
+        IPSecReplayWindow(bad_value)
+        assert False
+    except ValueError:
+        pass
+
+for bad_value in (-1, 'x', 1.5, True):
+    try:
+        SecurityAssociation(ESP, spi=0x222, replay_window=bad_value)
+        assert False
+    except (TypeError, ValueError):
+        pass
+
+shared_window = IPSecReplayWindow(4)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=shared_window)
+assert sa.replay_window is shared_window
+
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=4)
+assert isinstance(sa.replay_window, IPSecReplayWindow)
+assert sa.replay_window.window_size == 4
+
+#######################################
+= Anti-replay - ESP / IPv4 - window progression, reordering and rejection
+
+sender = SecurityAssociation(ESP, spi=0x222,
+                             crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                             auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=4)
+
+* explicit seq_num preserves the ability to craft the same packet repeatedly
+packets = {seq: sender.encrypt(replay_base_v4(), seq_num=seq, iv=FIXED_IV)
+           for seq in (1, 2, 3, 4, 5, 10)}
+
+* limited reordering: 3 first, then 1 and 2 fill the gaps
+sa.decrypt(replay_pkt(packets[3]))
+assert sa.replay_window.highest == 3
+assert sa.replay_window.bitmap == 0b1
+sa.decrypt(replay_pkt(packets[1]))
+sa.decrypt(replay_pkt(packets[2]))
+assert sa.replay_window.highest == 3
+assert sa.replay_window.bitmap == 0b111
+
+* a sequence already marked in the bitmap is a duplicate
+try:
+    sa.decrypt(replay_pkt(packets[2]))
+    assert False
+except IPSecReplayError:
+    pass
+
+* a jump slides the window and records only the new highest
+sa.decrypt(replay_pkt(packets[10]))
+assert sa.replay_window.highest == 10
+assert sa.replay_window.bitmap == 0b1
+
+* seq 1 and 4 are now older than the window (window covers 7..10)
+try:
+    sa.decrypt(replay_pkt(packets[1]))
+    assert False
+except IPSecReplayError:
+    pass
+
+try:
+    sa.decrypt(replay_pkt(packets[4]))
+    assert False
+except IPSecReplayError:
+    pass
+
+* the highest authenticated packet is itself a duplicate on replay
+try:
+    sa.decrypt(replay_pkt(packets[10]))
+    assert False
+except IPSecReplayError:
+    pass
+
+#######################################
+= Anti-replay - ESP / IPv4 - integrity failure never moves the window
+
+sender = SecurityAssociation(ESP, spi=0x222,
+                             crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                             auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=4)
+
+good = sender.encrypt(replay_base_v4(), seq_num=5, iv=FIXED_IV)
+
+* a forged packet claims a high sequence number but fails authentication
+forged = sender.encrypt(replay_base_v4(), seq_num=100, iv=FIXED_IV)
+forged[ESP].seq = 999
+try:
+    sa.decrypt(replay_pkt(forged))
+    assert False
+except IPSecIntegrityError:
+    pass
+
+assert sa.replay_window.highest == 0
+assert sa.replay_window.bitmap == 0
+
+* the forged packet cannot push later legitimate packets out of the window
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=1, iv=FIXED_IV)))
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=2, iv=FIXED_IV)))
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=3, iv=FIXED_IV)))
+assert sa.replay_window.highest == 3
+
+* the in-window legitimate packet is still accepted after the failed forgery
+sa.decrypt(replay_pkt(good))
+assert sa.replay_window.highest == 5
+
+#######################################
+= Anti-replay - ESP / IPv4 - verify=False leaves no authenticated record
+
+sender = SecurityAssociation(ESP, spi=0x222,
+                             crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                             auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=8)
+
+e = sender.encrypt(replay_base_v4(), seq_num=7, iv=FIXED_IV)
+sa.decrypt(replay_pkt(e), verify=False)
+assert sa.replay_window.highest == 0
+assert sa.replay_window.bitmap == 0
+
+* the same packet is still accepted once it is actually authenticated
+sa.decrypt(replay_pkt(e))
+assert sa.replay_window.highest == 7
+
+#######################################
+= Anti-replay - AH / IPv4
+
+sa = SecurityAssociation(AH, spi=0x333,
+                         auth_algo='SHA2-256-128', auth_key=AUTH_KEY,
+                         replay_window=4)
+e = sa.encrypt(replay_base_v4())
+sa.decrypt(replay_pkt(e))
+assert sa.replay_window.highest == 1
+
+try:
+    sa.decrypt(replay_pkt(e))
+    assert False
+except IPSecReplayError:
+    pass
+
+#######################################
+= Anti-replay - ESP / IPv6
+
+sa = SecurityAssociation(ESP, spi=0x444,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=4)
+e = sa.encrypt(replay_base_v6())
+sa.decrypt(replay_pkt(e))
+assert sa.replay_window.highest == 1
+
+try:
+    sa.decrypt(replay_pkt(e))
+    assert False
+except IPSecReplayError:
+    pass
+
+#######################################
+= Anti-replay - AH / IPv6
+
+sa = SecurityAssociation(AH, spi=0x555,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=4)
+e = sa.encrypt(replay_base_v6())
+sa.decrypt(replay_pkt(e))
+assert sa.replay_window.highest == 1
+
+try:
+    sa.decrypt(replay_pkt(e))
+    assert False
+except IPSecReplayError:
+    pass
+
+#######################################
+= Anti-replay - window size 0 only accepts strictly greater sequence numbers
+
+sender = SecurityAssociation(ESP, spi=0x222,
+                             crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                             auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY)
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key=CRYPT_KEY,
+                         auth_algo='HMAC-SHA1-96', auth_key=AUTH_KEY,
+                         replay_window=0)
+
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=2, iv=FIXED_IV)))
+try:
+    sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                         seq_num=1, iv=FIXED_IV)))
+    assert False
+except IPSecReplayError:
+    pass
+
+try:
+    sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                         seq_num=2, iv=FIXED_IV)))
+    assert False
+except IPSecReplayError:
+    pass
+
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=3, iv=FIXED_IV)))
+assert sa.replay_window.highest == 3
+
+#######################################
+= Anti-replay - ESN low 32-bit wrap (ESP / AES-GCM)
+
+GCM_KEY = b'16bytekey+4bytenonce'
+GCM_IV = bytes(range(8))
+
+sender = SecurityAssociation(ESP, spi=0x666,
+                             crypt_algo='AES-GCM', crypt_key=GCM_KEY,
+                             esn_en=True, esn=0)
+sa = SecurityAssociation(ESP, spi=0x666,
+                         crypt_algo='AES-GCM', crypt_key=GCM_KEY,
+                         esn_en=True, esn=0, replay_window=4)
+
+* last sequence number of the high word 0
+e_lo = sender.encrypt(replay_base_v4(), seq_num=0xFFFFFFFF, iv=GCM_IV)
+sa.decrypt(replay_pkt(e_lo), esn=0)
+assert sa.replay_window.highest == 0xFFFFFFFF
+
+* the wire sequence restarts at 1 with high word 1: ordinary 64-bit math
+e_wrap = sender.encrypt(replay_base_v4(), seq_num=1, iv=GCM_IV, esn=1)
+sa.decrypt(replay_pkt(e_wrap), esn=1)
+assert sa.replay_window.highest == 0x100000001
+
+* the wrapped packet is a duplicate on replay
+try:
+    sa.decrypt(replay_pkt(e_wrap), esn=1)
+    assert False
+except IPSecReplayError:
+    pass
+
+* a previous-high-word packet only 3 behind the highest stays within the window
+e_late = sender.encrypt(replay_base_v4(), seq_num=0xFFFFFFFE, iv=GCM_IV)
+sa.decrypt(replay_pkt(e_late), esn=0)
+try:
+    sa.decrypt(replay_pkt(e_late), esn=0)
+    assert False
+except IPSecReplayError:
+    pass
+
+* once the window slides forward, the old high word falls out of it
+sa.decrypt(replay_pkt(sender.encrypt(replay_base_v4(),
+                                     seq_num=5, iv=GCM_IV, esn=1)), esn=1)
+assert sa.replay_window.highest == 0x100000005
+try:
+    sa.decrypt(replay_pkt(e_lo), esn=0)
+    assert False
+except IPSecReplayError:
+    pass
+

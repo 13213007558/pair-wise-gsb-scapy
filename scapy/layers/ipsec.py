@@ -926,11 +926,99 @@ def zero_mutable_fields(pkt, sending=False):
 ###############################################################################
 
 
+class IPSecReplayError(Exception):
+    """
+    Error raised when a packet is rejected by the anti-replay window, either
+    because its sequence number was already received or because it is too old.
+    """
+
+    pass
+
+
+class IPSecReplayWindow(object):
+    """
+    Sliding anti-replay window over the (possibly 64-bit) sequence numbers of
+    an IPsec SA, as described in RFC 4301 section 4.1 and RFC 4303/4302.
+
+    The window holds a bitmap of the last ``window_size`` sequence numbers
+    behind the highest authenticated one. Packets already marked in the bitmap
+    are duplicates and packets older than the window are rejected. A window
+    size of 0 only accepts sequence numbers strictly greater than the highest
+    authenticated one (no reordering allowed).
+
+    The state is only updated by :meth:`update`, which the
+    :class:`SecurityAssociation` calls after a successful integrity check: a
+    packet that fails authentication never shifts the window. With a NULL
+    integrity algorithm there is no check to fail, so every accepted packet
+    updates the window.
+    """
+
+    def __init__(self, window_size=64):
+        if (
+            not isinstance(window_size, int)
+            or isinstance(window_size, bool)
+            or window_size < 0
+        ):
+            raise ValueError('window_size must be a non-negative integer')
+        self.window_size = window_size
+        self.bitmap = 0
+        self.highest = 0
+
+    def check(self, seq_num):
+        """
+        Check whether ``seq_num`` may be accepted without updating the state.
+
+        :param seq_num: the full (extended) sequence number of the packet
+        :raise scapy.layers.ipsec.IPSecReplayError: if the sequence number is a
+            duplicate or older than the window
+        """
+        if seq_num <= 0:
+            raise IPSecReplayError(
+                'rejected sequence number %d: sequence numbers start at 1'
+                % seq_num)
+        if seq_num > self.highest:
+            return
+        diff = self.highest - seq_num
+        if self.window_size and diff < self.window_size:
+            if (self.bitmap >> diff) & 1:
+                raise IPSecReplayError(
+                    'rejected duplicate sequence number %d' % seq_num)
+        else:
+            raise IPSecReplayError(
+                'rejected sequence number %d, older than the window '
+                '(highest=%d, window_size=%d)'
+                % (seq_num, self.highest, self.window_size))
+
+    def update(self, seq_num):
+        """
+        Record an authenticated sequence number and slide the window forward
+        when needed.
+
+        :param seq_num: the full (extended) sequence number of an
+                        authenticated packet
+        """
+        if seq_num > self.highest:
+            diff = seq_num - self.highest
+            if diff >= self.window_size:
+                self.bitmap = 1
+            else:
+                self.bitmap = ((self.bitmap << diff) | 1) & (
+                    (1 << self.window_size) - 1)
+            self.highest = seq_num
+        else:
+            self.bitmap |= 1 << (self.highest - seq_num)
+
+
+###############################################################################
+
+
 class SecurityAssociation(object):
     """
     This class is responsible of "encryption" and "decryption" of IPsec packets.
 
-    This does not check replay, and shouldn't be used as-is in production.
+    By default, this does not check replay, and shouldn't be used as-is in
+    production. Pass ``replay_window`` to enable a sliding anti-replay window
+    on the receive path (see :class:`IPSecReplayWindow`).
     """
 
     SUPPORTED_PROTOS = (IP, IPv6)
@@ -938,7 +1026,8 @@ class SecurityAssociation(object):
     def __init__(self, proto, spi, seq_num=1, crypt_algo=None, crypt_key=None,
                  crypt_icv_size=None,
                  auth_algo=None, auth_key=None,
-                 tunnel_header=None, nat_t_header=None, esn_en=False, esn=0):
+                 tunnel_header=None, nat_t_header=None, esn_en=False, esn=0,
+                 replay_window=None):
         """
         :param proto: the IPsec proto to use (ESP or AH)
         :param spi: the Security Parameters Index of this SA
@@ -958,6 +1047,15 @@ class SecurityAssociation(object):
                        64-bit sequence number instead of 32-bit when using an
                        AEAD algorithm
         :param esn: extended sequence number (32 MSB)
+        :param replay_window: enable the receive anti-replay window. Either a
+                              non-negative integer giving the window size
+                              (defaults to 64) or an existing
+                              :class:`IPSecReplayWindow` instance. When None
+                              (the default), no replay check is performed,
+                              matching the historical behavior. The window is
+                              only consulted on integrity-checked packets and
+                              is updated only after the integrity check
+                              succeeds.
         """
 
         if proto not in {ESP, AH, ESP.name, AH.name}:
@@ -1012,6 +1110,21 @@ class SecurityAssociation(object):
             if not isinstance(nat_t_header, UDP):
                 raise TypeError('nat_t_header must be %s' % UDP.name)
         self.nat_t_header = nat_t_header
+
+        if replay_window is None:
+            self.replay_window = None
+        elif isinstance(replay_window, IPSecReplayWindow):
+            self.replay_window = replay_window
+        elif (
+            isinstance(replay_window, int)
+            and not isinstance(replay_window, bool)
+            and replay_window >= 0
+        ):
+            self.replay_window = IPSecReplayWindow(replay_window)
+        else:
+            raise TypeError(
+                'replay_window must be None, a non-negative integer or an '
+                'IPSecReplayWindow instance')
 
     def check_spi(self, pkt):
         if pkt.spi != self.spi:
@@ -1249,7 +1362,9 @@ class SecurityAssociation(object):
         Decrypt (and decapsulate) an IP(v6) packet containing ESP or AH.
 
         :param pkt:     the packet to decrypt
-        :param verify:  if False, do not perform the integrity check
+        :param verify:  if False, do not perform the integrity check. The
+                        anti-replay window is not consulted or updated in that
+                        case, since an unverified packet is not authenticated.
         :param esn_en:  extended sequence number enable which allows to use
                         64-bit sequence number instead of 32-bit when using an
                         AEAD algorithm
@@ -1257,15 +1372,41 @@ class SecurityAssociation(object):
         :returns: the decrypted/decapsulated packet
         :raise scapy.layers.ipsec.IPSecIntegrityError: if the integrity check
             fails
+        :raise scapy.layers.ipsec.IPSecReplayError: if the anti-replay window
+            rejects the sequence number (duplicate or too old)
         """
         if not isinstance(pkt, self.SUPPORTED_PROTOS):
             raise TypeError('cannot decrypt %s, supported protos are %s'
                             % (pkt.__class__, self.SUPPORTED_PROTOS))
 
         if self.proto is ESP and pkt.haslayer(ESP):
-            return self._decrypt_esp(pkt, verify=verify,
-                                     esn_en=esn_en, esn=esn)
+            ipsec_pkt = pkt[ESP]
         elif self.proto is AH and pkt.haslayer(AH):
-            return self._decrypt_ah(pkt, verify=verify, esn_en=esn_en, esn=esn)
+            ipsec_pkt = pkt[AH]
         else:
             raise TypeError('%s has no %s layer' % (pkt, self.proto.name))
+
+        replay_window = self.replay_window if verify else None
+        if replay_window is not None:
+            # The window works on the full sequence number: with ESN the
+            # 32-bit value on the wire is combined with the 32 MSB, so the
+            # low 32-bit wrap is handled by ordinary 64-bit arithmetic.
+            if esn_en or self.esn_en:
+                seq_num = ((esn or self.esn) << 32) | ipsec_pkt.seq
+            else:
+                seq_num = ipsec_pkt.seq
+            replay_window.check(seq_num)
+
+        if self.proto is ESP:
+            decrypted = self._decrypt_esp(pkt, verify=verify,
+                                          esn_en=esn_en, esn=esn)
+        else:
+            decrypted = self._decrypt_ah(pkt, verify=verify,
+                                         esn_en=esn_en, esn=esn)
+
+        if replay_window is not None:
+            # Only an authenticated packet may move the window: reaching this
+            # point means the integrity check did not raise.
+            replay_window.update(seq_num)
+
+        return decrypted
