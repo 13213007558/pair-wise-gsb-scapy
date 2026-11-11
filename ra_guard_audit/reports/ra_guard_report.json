@@ -1,0 +1,611 @@
+{
+  "pcap": "samples/ra_guard_sample.pcap",
+  "generated_utc": "2026-11-11T02:13:40Z",
+  "summary": {
+    "total_frames": 23,
+    "ipv6_frames": 22,
+    "verdict_counts": {
+      "ra": 4,
+      "violation": 7,
+      "inconclusive": 4,
+      "benign": 7,
+      "out_of_scope": 1
+    },
+    "fragment_flows": 4,
+    "incomplete_fragment_flows": 2
+  },
+  "verdict_legend": {
+    "ra": "Validated Router Advertisement",
+    "violation": "Violation",
+    "inconclusive": "Inconclusive (not passed by default)",
+    "benign": "Benign non-RA traffic",
+    "out_of_scope": "Out of scope (non-IPv6)"
+  },
+  "frames": [
+    {
+      "frame": 1,
+      "timestamp": 1794363219.410183,
+      "wire_length": 110,
+      "captured_length": 110,
+      "src": "fe80::1",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "ra",
+      "reasons": [
+        "valid_ra"
+      ],
+      "details": [
+        "RA with hop limit 255, link-local source, zero code and a valid ICMPv6 checksum"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 44789,
+      "checksum_computed": 44789
+    },
+    {
+      "frame": 2,
+      "timestamp": 1794363219.410456,
+      "wire_length": 102,
+      "captured_length": 102,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 1,
+      "verdict": "violation",
+      "reasons": [
+        "nd_hop_limit_not_255"
+      ],
+      "details": [
+        "ND type 134 observed with hop limit 1"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 56143,
+      "checksum_computed": 56143
+    },
+    {
+      "frame": 3,
+      "timestamp": 1794363219.410572,
+      "wire_length": 70,
+      "captured_length": 70,
+      "src": "2001:db8::1",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "ra_source_not_link_local"
+      ],
+      "details": [
+        "RA source 2001:db8::1 is outside fe80::/10"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 10695,
+      "checksum_computed": 10695
+    },
+    {
+      "frame": 4,
+      "timestamp": 1794363219.410655,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "ra",
+      "reasons": [
+        "valid_ra"
+      ],
+      "details": [
+        "RA with hop limit 255, link-local source, zero code and a valid ICMPv6 checksum"
+      ],
+      "extension_headers": [
+        0
+      ],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 25195,
+      "checksum_computed": 25195
+    },
+    {
+      "frame": 5,
+      "timestamp": 1794363219.410811,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "ra",
+      "reasons": [
+        "valid_ra"
+      ],
+      "details": [
+        "RA with hop limit 255, link-local source, zero code and a valid ICMPv6 checksum"
+      ],
+      "extension_headers": [
+        60
+      ],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 25195,
+      "checksum_computed": 25195
+    },
+    {
+      "frame": 6,
+      "timestamp": 1794363219.410944,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "ra",
+      "reasons": [
+        "valid_ra"
+      ],
+      "details": [
+        "RA with hop limit 255, link-local source, zero code and a valid ICMPv6 checksum"
+      ],
+      "extension_headers": [
+        0,
+        60
+      ],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 28675,
+      "checksum_computed": 28675
+    },
+    {
+      "frame": 7,
+      "timestamp": 1794363219.411157,
+      "wire_length": 60,
+      "captured_length": 60,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "icmpv6_checksum_bad",
+        "ra_shorter_than_16_octets"
+      ],
+      "details": [
+        "checksum 0x0000 does not match computed 0x3085",
+        "RA body is 6 octets, fixed header requires 16"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 134,
+      "checksum_declared": 0,
+      "checksum_computed": 12421
+    },
+    {
+      "frame": 8,
+      "timestamp": 1794363219.411942,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "fragmented_neighbor_discovery_rfc6980"
+      ],
+      "details": [
+        "offset-zero fragment reveals ICMPv6 ND type 134; RFC 6980 section 4 forbids fragmented Neighbor Discovery",
+        "flow members: 8, 9"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 4369,
+      "fragment_offset": 0,
+      "fragment_more": 1,
+      "flow_key": "fe80::bad -> ff02::1 id=0x00001111",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 9,
+      "timestamp": 1794363219.412065,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "non_initial_fragment_of_nd_flow_rfc6980"
+      ],
+      "details": [
+        "non-initial fragment of a flow whose offset-zero fragment is an ICMPv6 Neighbor Discovery message (RFC 6980 section 4)",
+        "flow members: 8, 9"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 4369,
+      "fragment_offset": 24,
+      "fragment_more": 0,
+      "flow_key": "fe80::bad -> ff02::1 id=0x00001111",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 10,
+      "timestamp": 1794363219.412344,
+      "wire_length": 62,
+      "captured_length": 62,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "fragment_0_hides_nd_type_rfc6980"
+      ],
+      "details": [
+        "offset-zero fragment carries 0 fragmentable octet(s), so the ICMPv6 type is not visible; RFC 6980 section 4 requires dropping this fragment",
+        "flow members: 10, 11"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 8738,
+      "fragment_offset": 0,
+      "fragment_more": 1,
+      "flow_key": "fe80::bad -> ff02::1 id=0x00002222",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 11,
+      "timestamp": 1794363219.412409,
+      "wire_length": 110,
+      "captured_length": 110,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "violation",
+      "reasons": [
+        "fragment_0_hides_nd_type_rfc6980"
+      ],
+      "details": [
+        "offset-zero fragment carries 0 fragmentable octet(s), so the ICMPv6 type is not visible; RFC 6980 section 4 requires dropping this fragment",
+        "flow members: 10, 11"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 8738,
+      "fragment_offset": 0,
+      "fragment_more": 0,
+      "flow_key": "fe80::bad -> ff02::1 id=0x00002222",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 12,
+      "timestamp": 1794363219.41251,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "inconclusive",
+      "reasons": [
+        "fragment_flow_incomplete"
+      ],
+      "details": [
+        "fragment flow never completed within the capture",
+        "missing byte ranges: [(0, 128)]",
+        "flow members: 12"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 13107,
+      "fragment_offset": 128,
+      "fragment_more": 0,
+      "flow_key": "2001:db8::1 -> 2001:db8::2 id=0x00003333",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 13,
+      "timestamp": 1794363219.412784,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "benign",
+      "reasons": [
+        "fragmented_non_nd_traffic"
+      ],
+      "details": [
+        "fragmented payload next header 59 is not ICMPv6",
+        "flow members: 13, 14"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 17476,
+      "fragment_offset": 0,
+      "fragment_more": 1,
+      "flow_key": "2001:db8::1 -> 2001:db8::2 id=0x00004444",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 14,
+      "timestamp": 1794363219.412891,
+      "wire_length": 106,
+      "captured_length": 106,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "benign",
+      "reasons": [
+        "fragmented_non_nd_traffic"
+      ],
+      "details": [
+        "non-initial fragment of a non-ND fragment flow",
+        "flow members: 13, 14"
+      ],
+      "extension_headers": [
+        44
+      ],
+      "fragment_id": 17476,
+      "fragment_offset": 64,
+      "fragment_more": 0,
+      "flow_key": "2001:db8::1 -> 2001:db8::2 id=0x00004444",
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 15,
+      "timestamp": 1794363219.412992,
+      "wire_length": 104,
+      "captured_length": 104,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "benign",
+      "reasons": [
+        "not_icmpv6"
+      ],
+      "details": [
+        "next header 6 is not ICMPv6; a 0x86 octet in the payload is application data, not an RA"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 16,
+      "timestamp": 1794363219.413119,
+      "wire_length": 84,
+      "captured_length": 84,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "benign",
+      "reasons": [
+        "not_icmpv6"
+      ],
+      "details": [
+        "next header 17 is not ICMPv6; a 0x86 octet in the payload is application data, not an RA"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 17,
+      "timestamp": 1794363219.413219,
+      "wire_length": 77,
+      "captured_length": 77,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "benign",
+      "reasons": [
+        "non_ra_icmpv6"
+      ],
+      "details": [
+        "ICMPv6 type 128 is not a Router Advertisement"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 128,
+      "checksum_declared": 8768,
+      "checksum_computed": 8768
+    },
+    {
+      "frame": 18,
+      "timestamp": 1794363219.413299,
+      "wire_length": 98,
+      "captured_length": 98,
+      "src": "2001:db8::1",
+      "dst": "2001:db8::2",
+      "hop_limit": 64,
+      "verdict": "inconclusive",
+      "reasons": [
+        "esp_payload_encrypted"
+      ],
+      "details": [
+        "ESP payload hides the inner next header; no offline decision is possible without keys"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 19,
+      "timestamp": 1794363219.413411,
+      "wire_length": 78,
+      "captured_length": 78,
+      "src": "fe80::1",
+      "dst": "ff02::1:ff00:2",
+      "hop_limit": 255,
+      "verdict": "benign",
+      "reasons": [
+        "non_ra_icmpv6"
+      ],
+      "details": [
+        "ICMPv6 type 135 is not a Router Advertisement"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 135,
+      "checksum_declared": 32161,
+      "checksum_computed": 32161
+    },
+    {
+      "frame": 20,
+      "timestamp": 1794363219.413496,
+      "wire_length": 86,
+      "captured_length": 86,
+      "src": "fe80::2",
+      "dst": "fe80::1",
+      "hop_limit": 255,
+      "verdict": "benign",
+      "reasons": [
+        "non_ra_icmpv6"
+      ],
+      "details": [
+        "ICMPv6 type 136 is not a Router Advertisement"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": 136,
+      "checksum_declared": 39193,
+      "checksum_computed": 39193
+    },
+    {
+      "frame": 21,
+      "timestamp": 1794363219.413927,
+      "wire_length": 64,
+      "captured_length": 64,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "inconclusive",
+      "reasons": [
+        "truncated_icmpv6_header"
+      ],
+      "details": [
+        "captured 10 payload octets, IPv6 payload length declares 48"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 22,
+      "timestamp": 1794363219.414325,
+      "wire_length": 60,
+      "captured_length": 60,
+      "src": "fe80::bad",
+      "dst": "ff02::1",
+      "hop_limit": 255,
+      "verdict": "inconclusive",
+      "reasons": [
+        "truncated_extension_header"
+      ],
+      "details": [
+        "extension header 0 extends past captured bytes"
+      ],
+      "extension_headers": [
+        0
+      ],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    },
+    {
+      "frame": 23,
+      "timestamp": 1794363219.414397,
+      "wire_length": 42,
+      "captured_length": 42,
+      "src": null,
+      "dst": null,
+      "hop_limit": null,
+      "verdict": "out_of_scope",
+      "reasons": [
+        "non_ipv6_frame"
+      ],
+      "details": [
+        "frame does not carry IPv6"
+      ],
+      "extension_headers": [],
+      "fragment_id": null,
+      "fragment_offset": null,
+      "fragment_more": null,
+      "flow_key": null,
+      "icmpv6_type": null,
+      "checksum_declared": null,
+      "checksum_computed": null
+    }
+  ]
+}
