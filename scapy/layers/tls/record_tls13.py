@@ -22,6 +22,7 @@ from scapy.layers.tls.session import _GenericTLSSessionInheritance
 from scapy.layers.tls.basefields import _TLSVersionField, _tls_version, \
     _TLSMACField, _TLSLengthField, _tls_type
 from scapy.layers.tls.record import _TLSMsgListField, TLS
+from scapy.packet import Raw
 from scapy.layers.tls.crypto.cipher_aead import AEADTagError
 from scapy.layers.tls.crypto.cipher_stream import Cipher_NULL
 from scapy.layers.tls.crypto.common import CipherError
@@ -33,9 +34,25 @@ from scapy.layers.tls.crypto.pkcs1 import pkcs_i2osp
 ###############################################################################
 
 
+class _TLS13MsgListField(_TLSMsgListField):
+    """
+    TLS 1.3 version of the record message list. When the record failed the
+    AEAD integrity check, the decrypted bytes are not authenticated and must
+    not drive the tlsSession through post_dissection_tls_session_update()
+    (RFC 8446 section 4.6.3 requires the key schedule to follow only
+    authenticated records). The bytes are kept as a single Raw layer for
+    inspection purposes.
+    """
+
+    def getfield(self, pkt, s):
+        if getattr(pkt.tls_session, "record_integrity_failed", False):
+            return b"", [Raw(load=s)]
+        return super(_TLS13MsgListField, self).getfield(pkt, s)
+
+
 class TLSInnerPlaintext(_GenericTLSSessionInheritance):
     name = "TLS Inner Plaintext"
-    fields_desc = [_TLSMsgListField("msg", []),
+    fields_desc = [_TLS13MsgListField("msg", []),
                    ByteEnumField("type", None, _tls_type),
                    XStrField("pad", "")]
 
@@ -77,6 +94,13 @@ class _TLSInnerPlaintextField(PacketField):
         if frag_len < 1:
             warning("InnerPlaintext should at least contain a byte type!")
             return s, None
+        if getattr(pkt.tls_session, "record_integrity_failed", False):
+            # Keep the unauthenticated plaintext as a Raw layer instead of
+            # parsing it (which could update the tlsSession).
+            return s[frag_len:], TLSInnerPlaintext(
+                msg=[Raw(load=s[:frag_len])],
+                tls_session=pkt.tls_session,
+            )
         remain, i = super(_TLSInnerPlaintextField, self).getfield(pkt, s[:frag_len])  # noqa: E501
         # remain should be empty here
         return remain + s[frag_len:], i
@@ -90,7 +114,7 @@ class _TLSInnerPlaintextField(PacketField):
 
 
 class TLS13(_GenericTLSSessionInheritance):
-    __slots__ = ["deciphered_len", "strict_integrity"]
+    __slots__ = ["deciphered_len", "strict_integrity", "integrity_failed"]
     name = "TLS 1.3"
     fields_desc = [ByteEnumField("type", 0x17, _tls_type),
                    _TLSVersionField("version", 0x0303, _tls_version),
@@ -101,6 +125,7 @@ class TLS13(_GenericTLSSessionInheritance):
     def __init__(self, *args, **kargs):
         self.deciphered_len = kargs.get("deciphered_len", None)
         self.strict_integrity = kargs.pop("strict_integrity", False)
+        self.integrity_failed = False
         super(TLS13, self).__init__(*args, **kargs)
 
     # Parsing methods
@@ -126,6 +151,8 @@ class TLS13(_GenericTLSSessionInheritance):
         except AEADTagError as e:
             pkt_info = self.firstlayer().summary()
             log_runtime.info("TLS 1.3: record integrity check failed [%s]", pkt_info)  # noqa: E501
+            self.integrity_failed = True
+            self.tls_session.record_integrity_failed = True
             if self.strict_integrity:
                 raise
             return e.args
@@ -134,6 +161,9 @@ class TLS13(_GenericTLSSessionInheritance):
         """
         Decrypt, verify and decompress the message.
         """
+        # The previous record may have left the flag set if its integrity
+        # check failed. Each record dissection starts from a clean state.
+        self.tls_session.record_integrity_failed = False
         # We commit the pending read state if it has been triggered.
         if self.tls_session.triggered_prcs_commit:
             if self.tls_session.prcs is not None:

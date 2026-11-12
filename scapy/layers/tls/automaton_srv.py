@@ -1148,10 +1148,13 @@ class TLSServerAutomaton(_TLSAutomaton):
             raise self.CLOSE_NOTIFY()
         elif isinstance(p, TLS13KeyUpdate):
             print("> Received: %r" % p)
-            p = TLS13KeyUpdate(request_update=0)
-            self.add_record()
-            self.add_msg(p)
-            raise self.ADDED_SERVERDATA()
+            # RFC 8446 section 4.6.3: the peer only sends its own KeyUpdate
+            # when the request_update field was set to update_requested.
+            if p.request_update == 1:
+                p = TLS13KeyUpdate(request_update=0)
+                self.add_record()
+                self.add_msg(p)
+                raise self.ADDED_SERVERDATA()
         else:
             print("> Received: %r" % p)
 

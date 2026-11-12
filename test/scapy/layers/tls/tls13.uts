@@ -1355,3 +1355,151 @@ def parses_share(value):
 
 assert not parses_share(1)
 assert parses_share(2)
+
++ KeyUpdate traffic secret handling
+# All traffic secrets below are generated locally with TLS13_HKDF; no secret
+# material is printed. Records are built with one endpoint and dissected with
+# the other. Only authenticated plaintext counts as success: records failing
+# the AEAD check expose a Raw layer and must never rotate the tlsSession.
+
+= KeyUpdate - local endpoints and authenticated sequences
+
+import os as _os
+from scapy.layers.tls.crypto.hkdf import TLS13_HKDF
+from scapy.layers.tls.crypto.cipher_aead import AEADTagError
+from scapy.layers.tls.crypto.suites import TLS_AES_128_GCM_SHA256
+from scapy.layers.tls.handshake import TLS13KeyUpdate
+from scapy.layers.tls.record import TLSApplicationData
+from scapy.layers.tls.record_tls13 import TLS13
+from scapy.layers.tls.session import tlsSession, readConnState, writeConnState
+from scapy.packet import Raw as _Raw
+
+def _ku_endpoint(connection_end, cts0, sts0):
+    s = tlsSession(connection_end=connection_end)
+    s.tls_version = 0x0304
+    s.advertised_tls_version = 0x0304
+    s.post_handshake = True
+    if connection_end == "client":
+        s.wcs = writeConnState(ciphersuite=TLS_AES_128_GCM_SHA256,
+                               connection_end="client", tls_version=0x0304)
+        s.rcs = readConnState(ciphersuite=TLS_AES_128_GCM_SHA256,
+                              connection_end="client", tls_version=0x0304)
+        s.wcs.tls13_derive_keys(cts0)
+        s.rcs.tls13_derive_keys(sts0)
+    else:
+        s.wcs = writeConnState(ciphersuite=TLS_AES_128_GCM_SHA256,
+                               connection_end="server", tls_version=0x0304)
+        s.rcs = readConnState(ciphersuite=TLS_AES_128_GCM_SHA256,
+                              connection_end="server", tls_version=0x0304)
+        s.wcs.tls13_derive_keys(sts0)
+        s.rcs.tls13_derive_keys(cts0)
+    s.tls13_derived_secrets["client_traffic_secrets"] = [cts0]
+    s.tls13_derived_secrets["server_traffic_secrets"] = [sts0]
+    return s
+
+def _ku_build(session, *msgs):
+    record = TLS13(tls_session=session)
+    for msg in msgs:
+        record.inner.msg.append(msg)
+    return record.raw_stateful()
+
+def _ku_plain(record):
+    out = []
+    for msg in record.inner.msg:
+        if isinstance(msg, TLSApplicationData):
+            out.append(("app", bytes(msg.data)))
+        elif isinstance(msg, TLS13KeyUpdate):
+            out.append(("keyupdate", int(msg.request_update)))
+        elif isinstance(msg, _Raw):
+            out.append(("raw", None))
+        else:
+            out.append((type(msg).__name__, None))
+    return out
+
+_hkdf = TLS13_HKDF("sha256")
+_cts0 = _hkdf.derive_secret(_os.urandom(32), b"c ap traffic", _os.urandom(32))
+_sts0 = _hkdf.derive_secret(_os.urandom(32), b"s ap traffic", _os.urandom(32))
+
+# one-sided update: client rotates its write traffic secret
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+ku = TLS13(_ku_build(client, TLS13KeyUpdate(request_update=0)),
+           tls_session=server, strict_integrity=True)
+assert _ku_plain(ku) == [("keyupdate", 0)]
+after = TLS13(_ku_build(client, TLSApplicationData(data=b"client-gen1")),
+              tls_session=server, strict_integrity=True)
+assert _ku_plain(after) == [("app", b"client-gen1")]
+# the server write direction is untouched
+peer = TLS13(_ku_build(server, TLSApplicationData(data=b"server-gen0")),
+             tls_session=client, strict_integrity=True)
+assert _ku_plain(peer) == [("app", b"server-gen0")]
+
+= KeyUpdate - request_update and successive updates
+
+# request_update=1 authenticates, and the peer response uses its own rotation
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+req = TLS13(_ku_build(client, TLS13KeyUpdate(request_update=1)),
+            tls_session=server, strict_integrity=True)
+assert _ku_plain(req) == [("keyupdate", 1)]
+resp = TLS13(_ku_build(server, TLS13KeyUpdate(request_update=0)),
+             tls_session=client, strict_integrity=True)
+assert _ku_plain(resp) == [("keyupdate", 0)]
+c_g2 = TLS13(_ku_build(client, TLSApplicationData(data=b"c-g2")), tls_session=server, strict_integrity=True)
+assert _ku_plain(c_g2) == [("app", b"c-g2")]
+s_g2 = TLS13(_ku_build(server, TLSApplicationData(data=b"s-g2")), tls_session=client, strict_integrity=True)
+assert _ku_plain(s_g2) == [("app", b"s-g2")]
+
+# successive updates on both directions keep independent generations
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+TLS13(_ku_build(client, TLS13KeyUpdate(request_update=0)), tls_session=server)
+TLS13(_ku_build(server, TLS13KeyUpdate(request_update=0)), tls_session=client)
+TLS13(_ku_build(client, TLS13KeyUpdate(request_update=0)), tls_session=server)
+c_g3 = TLS13(_ku_build(client, TLSApplicationData(data=b"c-g3")), tls_session=server, strict_integrity=True)
+assert _ku_plain(c_g3) == [("app", b"c-g3")]
+s_g2b = TLS13(_ku_build(server, TLSApplicationData(data=b"s-g2")), tls_session=client, strict_integrity=True)
+assert _ku_plain(s_g2b) == [("app", b"s-g2")]
+
+= KeyUpdate - failed integrity never rotates the read state
+
+# bad authentication tag, lenient mode: Raw only, rcs and secrets unchanged
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+rcs_before = server.rcs
+bad = bytearray(_ku_build(client, TLS13KeyUpdate(request_update=0)))
+bad[-1] ^= 0xFF
+record = TLS13(bytes(bad), tls_session=server)
+assert record.integrity_failed is True
+assert _ku_plain(record) == [("raw", None)]
+assert server.rcs is rcs_before
+assert server.prcs is None
+assert server.triggered_prcs_commit is False
+assert len(server.tls13_derived_secrets["client_traffic_secrets"]) == 1
+
+# same forged record, strict mode: AEADTagError and no state rotation
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+rcs_before = server.rcs
+try:
+    TLS13(bytes(bad), tls_session=server, strict_integrity=True)
+    raise AssertionError("AEADTagError not raised")
+except AEADTagError:
+    assert server.rcs is rcs_before
+    assert server.prcs is None
+    assert len(server.tls13_derived_secrets["client_traffic_secrets"]) == 1
+
+= KeyUpdate - truncated update record stays unauthenticated
+
+client = _ku_endpoint("client", _cts0, _sts0)
+server = _ku_endpoint("server", _cts0, _sts0)
+rcs_before = server.rcs
+ku_raw = _ku_build(client, TLS13KeyUpdate(request_update=0))
+truncated = ku_raw[:-3]
+truncated = truncated[:3] + struct.pack("!H", len(truncated) - 5) + truncated[5:]
+record = TLS13(truncated, tls_session=server)
+assert record.integrity_failed is True
+assert record.inner is None or all(isinstance(m, _Raw) for m in record.inner.msg)
+assert server.rcs is rcs_before
+assert server.prcs is None
+assert len(server.tls13_derived_secrets["client_traffic_secrets"]) == 1
